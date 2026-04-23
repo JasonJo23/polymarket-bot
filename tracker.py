@@ -193,7 +193,8 @@ class SignalTracker:
         self._reset_daily_if_needed()
 
         # KORJAUS 2: Päivätason duplikaattisuoja
-        sig_key = f"{signal['market_id']}_{signal['outcome']}"
+        # Blokaa koko markkina yhden oston jälkeen — ei osteta molempia puolia
+        sig_key = signal["market_id"]
         if sig_key in self._executed_today:
             log.debug(f"Duplikaatti tänään: {sig_key[:30]} — ohitetaan.")
             return False
