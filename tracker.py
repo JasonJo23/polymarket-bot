@@ -255,7 +255,11 @@ class SignalTracker:
                 log.warning(f"Hinta {token_price} liian äärimmäinen — markkina ratkaistu. Ohitetaan.")
                 return False
 
-            log.info(f"Token ID: {token_id[:16]}... | hinta: {token_price} | koko: {order_size} USDC")
+            # Lisää 2% slippage jotta tilaus täyttyy nopealiikkeisillä markkinoilla
+            slippage = float(os.getenv("SLIPPAGE_PCT", 0.02))
+            exec_price = round(min(token_price * (1 + slippage), 0.90), 3)
+            log.info(f"Token ID: {token_id[:16]}... | hinta: {token_price} → {exec_price} (+{slippage:.0%} slippage) | koko: {order_size} USDC")
+            token_price = exec_price
 
             proxy_address = _os.getenv("PROXY_WALLET_ADDRESS", "")
             if not proxy_address:
