@@ -90,6 +90,25 @@ def main():
     today_str        = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     daily_spent_usdc = 0.0
 
+    # Lataa päiväkulut levyltä uudelleenkäynnistyksen yli
+    import json as _json
+    _spending_file = "daily_spending.json"
+    try:
+        with open(_spending_file) as f:
+            _data = _json.load(f)
+            if _data.get("date") == today_str:
+                daily_spent_usdc = float(_data.get("spent", 0))
+                log.info(f"Ladattu päiväkulut: {daily_spent_usdc:.2f} USDC")
+    except Exception:
+        pass
+
+    def save_spending():
+        try:
+            with open(_spending_file, "w") as f:
+                _json.dump({"date": today_str, "spent": daily_spent_usdc}, f)
+        except Exception:
+            pass
+
     while True:
         try:
             current_day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -167,6 +186,7 @@ def main():
                             )
                             daily_spent_usdc += order_size
                             orders_this_cycle += 1
+                            save_spending()
                             log.info(f"Päiväkulut: {daily_spent_usdc:.2f} USDC")
                         elif success and dry_run:
                             orders_this_cycle += 1

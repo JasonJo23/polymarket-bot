@@ -146,7 +146,7 @@ class SignalTracker:
             # Suodata käytännössä ratkaistut markkinat
             tokens = market_info.get("tokens", [])
             prices = [float(t.get("price", 0.5)) for t in tokens if t.get("price")]
-            if prices and max(prices) > 0.95:
+            if prices and max(prices) > 0.90:
                 continue
 
             question = market_info.get("question", market_id[:20])
@@ -251,7 +251,7 @@ class SignalTracker:
                 return False
 
             # KORJAUS 3: Hintasuodatus
-            if token_price < 0.05 or token_price > 0.95:
+            if token_price < 0.05 or token_price > 0.90:
                 log.warning(f"Hinta {token_price} liian äärimmäinen — markkina ratkaistu. Ohitetaan.")
                 return False
 
