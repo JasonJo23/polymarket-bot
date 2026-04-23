@@ -1,0 +1,9 @@
+.env
+executed_today.json
+scout.log
+venv/
+__pycache__/
+*.pyc
+debug*.py
+test_*.py
+create_api_key.py

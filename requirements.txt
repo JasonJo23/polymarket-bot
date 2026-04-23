@@ -1,0 +1,4 @@
+requests
+python-dotenv
+polymarket-apis
+py-clob-client
