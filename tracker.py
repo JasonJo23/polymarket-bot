@@ -256,6 +256,16 @@ class SignalTracker:
                 log.warning(f"Hinta {token_price} liian äärimmäinen — markkina ratkaistu. Ohitetaan.")
                 return False
 
+            # INTELLIGENCE: Analysoi markkinan laatu ja momentum
+            try:
+                from intelligence import analyze_signal
+                intel = analyze_signal(signal, token_id, token_price)
+                if not intel["approved"]:
+                    log.warning(f"Intelligence hylkäsi oston: {intel['reason']}")
+                    return False
+            except Exception as e:
+                log.debug(f"Intelligence analyysi epäonnistui: {e} — jatketaan ilman")
+
             # Lisää 2% slippage jotta tilaus täyttyy nopealiikkeisillä markkinoilla
             slippage = float(os.getenv("SLIPPAGE_PCT", 0.02))
             exec_price = round(min(token_price * (1 + slippage), 0.90), 3)
