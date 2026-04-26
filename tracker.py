@@ -282,11 +282,13 @@ class SignalTracker:
                 address=proxy_address
             )
 
+            from polymarket_apis import OrderType
             order_args = MarketOrderArgs(
                 token_id=token_id,
                 amount=order_size,
                 side="BUY",
                 price=token_price,
+                order_type=OrderType.GTC,  # Good Till Cancelled — jää open orderiksi
             )
             resp = client.create_and_post_market_order(order_args)
 
