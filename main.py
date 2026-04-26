@@ -128,6 +128,8 @@ def main():
                 except Exception as e:
                     log.warning(f"Position check epäonnistui: {e}")
 
+            # Nopea position check odotuksen aikana (joka 5 min)
+
             # Bankroll-tarkistus (vain live)
             if not dry_run:
                 bankroll = get_bankroll_usdc()
@@ -210,7 +212,19 @@ def main():
         except Exception as e:
             log.error(f"Virhe pääsilmukassa: {e}", exc_info=True)
 
-        time.sleep(poll_interval)
+        # Nopea position check joka 5 minuutti odotuksen aikana
+        position_check_interval = int(os.getenv("POSITION_CHECK_SECONDS", 300))
+        elapsed_wait = 0
+        while elapsed_wait < poll_interval:
+            sleep_chunk = min(position_check_interval, poll_interval - elapsed_wait)
+            time.sleep(sleep_chunk)
+            elapsed_wait += sleep_chunk
+            if not dry_run and elapsed_wait < poll_interval:
+                try:
+                    from position_manager import check_and_exit_positions
+                    check_and_exit_positions()
+                except Exception as e:
+                    log.warning(f"Position check epäonnistui: {e}")
 
 
 if __name__ == "__main__":
