@@ -120,6 +120,14 @@ def main():
             log.info("--- Uusi skannaus alkaa ---")
             cycle_start = time.time()
 
+            # Tarkista avoimet positiot ja myy tarvittaessa
+            if not dry_run:
+                try:
+                    from position_manager import check_and_exit_positions
+                    check_and_exit_positions()
+                except Exception as e:
+                    log.warning(f"Position check epäonnistui: {e}")
+
             # Bankroll-tarkistus (vain live)
             if not dry_run:
                 bankroll = get_bankroll_usdc()

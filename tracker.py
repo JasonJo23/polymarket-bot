@@ -297,6 +297,20 @@ class SignalTracker:
                 return False
 
             log.info(f"✅ Osto tehty: {resp}")
+
+            # Lisää positio seurantaan
+            try:
+                from position_manager import add_position
+                add_position(
+                    signal=signal,
+                    token_id=token_id,
+                    buy_price=token_price,
+                    amount=order_size,
+                    end_date=signal.get("end_date", "")
+                )
+            except Exception as e:
+                log.debug(f"Position lisäys epäonnistui: {e}")
+
             # Merkitse ostetuksi VASTA onnistuneen oston jälkeen
             self._executed_today.add(sig_key)
             self._save_executed()
