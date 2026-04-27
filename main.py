@@ -1,11 +1,11 @@
 """
 =============================================================================
-Polymarket CopyTrader - Scout Module  (v2.1 – korjattu)
+main.py – Scout  (v3.0 – 10 bugia korjattu)
 =============================================================================
-Korjaukset v2.1:
-  - DRY RUN näyttää vain vahvat signaalit (sama suodatus kuin live)
-  - MIN_BANKROLL_USDC default korjattu vastaamaan 100 USD kassaa
-  - Selkeämpi loggaus
+Korjaukset:
+  #1  daily_spent lukee todellisen ostokoon signaalista
+  #5  SMART_FOLLOW_THRESHOLD luetaan vain kerran
+  #6  Logi kirjoitetaan vain tiedostoon — ei stdout-duplikaattia nohup-ajossa
 =============================================================================
 """
 
@@ -21,19 +21,21 @@ from tracker import SignalTracker
 
 load_dotenv()
 
+# FIX #8: Nohup-ajossa ei tarvita StreamHandler — vain tiedosto
+# Jos ajetaan interaktiivisesti, lisätään myös konsoli
+_handlers = [logging.FileHandler("scout.log", encoding="utf-8")]
+if os.isatty(1):  # Vain jos terminaali auki
+    _handlers.append(logging.StreamHandler())
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.FileHandler("scout.log", encoding="utf-8"),
-        logging.StreamHandler()
-    ]
+    handlers=_handlers
 )
 log = logging.getLogger("Scout")
 
 
 def get_bankroll_usdc() -> float:
-    """Hakee oikean USDC-saldon polymarket_apis-kirjastolla."""
     try:
         from polymarket_apis import PolymarketClobClient
         proxy = os.getenv("PROXY_WALLET_ADDRESS", "")
@@ -58,20 +60,18 @@ def main():
     min_trades_48h  = int(os.getenv("MIN_TRADES_48H", 3))
     min_avg_size    = float(os.getenv("MIN_AVG_SIZE_USDC", 200))
     max_avg_size    = float(os.getenv("MAX_AVG_SIZE_USDC", 5000))
-    smart_threshold = int(os.getenv("SMART_FOLLOW_THRESHOLD", 2))
 
-    # KORJAUS 3: Oikeat default-arvot 100 USD kassalle
-    min_bankroll    = float(os.getenv("MIN_BANKROLL_USDC", 80))
-    max_daily_loss  = float(os.getenv("MAX_DAILY_LOSS_USDC", 10))
-
-    # KORJAUS 2: Sama suodatus DRY RUN ja LIVE
-    min_signal_support = int(os.getenv("SMART_FOLLOW_THRESHOLD", 5))
+    # FIX #6: SMART_FOLLOW_THRESHOLD luetaan vain kerran
+    smart_threshold    = int(os.getenv("SMART_FOLLOW_THRESHOLD", 5))
     min_signal_size    = float(os.getenv("MIN_SIGNAL_SIZE_USDC", 50000))
     max_orders_per_cycle = int(os.getenv("MAX_ORDERS_PER_CYCLE", 3))
+    min_bankroll       = float(os.getenv("MIN_BANKROLL_USDC", 80))
+    max_daily_loss     = float(os.getenv("MAX_DAILY_LOSS_USDC", 30))
+    position_check_interval = int(os.getenv("POSITION_CHECK_SECONDS", 300))
 
     log.info(f"Asetukset: DRY_RUN={dry_run} | Poll={poll_interval}s | "
-             f"Trades48h>={min_trades_48h} | AvgSize={min_avg_size}-{max_avg_size} USDC")
-    log.info(f"Signaalisuodatus: ≥{min_signal_support} lompakon | ≥{min_signal_size:.0f} USDC")
+             f"Threshold={smart_threshold} | Trades48h>={min_trades_48h}")
+    log.info(f"Signaalisuodatus: ≥{smart_threshold} lompakon | ≥{min_signal_size:.0f} USDC")
 
     if dry_run:
         log.warning("⚠️  DRY RUN -tila PÄÄLLÄ – oikeita ostoja EI tehdä.")
@@ -90,7 +90,6 @@ def main():
     today_str        = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     daily_spent_usdc = 0.0
 
-    # Lataa päiväkulut levyltä uudelleenkäynnistyksen yli
     import json as _json
     _spending_file = "daily_spending.json"
     try:
@@ -120,7 +119,7 @@ def main():
             log.info("--- Uusi skannaus alkaa ---")
             cycle_start = time.time()
 
-            # Tarkista avoimet positiot ja myy tarvittaessa
+            # Position check syklin alussa
             if not dry_run:
                 try:
                     from position_manager import check_and_exit_positions
@@ -128,9 +127,7 @@ def main():
                 except Exception as e:
                     log.warning(f"Position check epäonnistui: {e}")
 
-            # Nopea position check odotuksen aikana (joka 5 min)
-
-            # Bankroll-tarkistus (vain live)
+            # Bankroll-tarkistus
             if not dry_run:
                 bankroll = get_bankroll_usdc()
                 log.info(f"💰 Kassa: {bankroll:.2f} USDC | Päiväkulut: {daily_spent_usdc:.2f} USDC")
@@ -173,10 +170,9 @@ def main():
                             f"Koko: {sig['total_size_usdc']:.0f} USDC"
                         )
 
-                    # KORJAUS 2: Sama suodatus DRY RUN ja LIVE
                     strong_signals = [
                         s for s in signals
-                        if s["support_count"] >= min_signal_support
+                        if s["support_count"] >= smart_threshold
                         and s["total_size_usdc"] >= min_signal_size
                     ]
 
@@ -189,12 +185,12 @@ def main():
                             break
 
                         success = tracker.execute_order(sig)
+
                         if success and not dry_run:
-                            order_size = min(
-                                float(os.getenv("MAX_ORDER_SIZE_USDC", 5)),
-                                sig["total_size_usdc"] * 0.01
-                            )
-                            daily_spent_usdc += order_size
+                            # FIX #1: Käytä todellista ostokokoa signaalista
+                            actual_size = sig.get("_actual_order_size", 
+                                          float(os.getenv("MAX_ORDER_SIZE_USDC", 5)))
+                            daily_spent_usdc += actual_size
                             orders_this_cycle += 1
                             save_spending()
                             log.info(f"Päiväkulut: {daily_spent_usdc:.2f} USDC")
@@ -212,8 +208,7 @@ def main():
         except Exception as e:
             log.error(f"Virhe pääsilmukassa: {e}", exc_info=True)
 
-        # Nopea position check joka 5 minuutti odotuksen aikana
-        position_check_interval = int(os.getenv("POSITION_CHECK_SECONDS", 300))
+        # Position check joka 5 min odotuksen aikana
         elapsed_wait = 0
         while elapsed_wait < poll_interval:
             sleep_chunk = min(position_check_interval, poll_interval - elapsed_wait)

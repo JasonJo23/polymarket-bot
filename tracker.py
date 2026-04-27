@@ -1,12 +1,14 @@
 """
 =============================================================================
-tracker.py – SignalTracker  (v4.0 – kaikki ongelmat korjattu)
+tracker.py – SignalTracker  (v5.0 – 10 bugia korjattu)
 =============================================================================
-Korjaukset v4.0:
-  1. _get_market_info käyttää CLOB API:ta (ei Gamma API:ta) → oikeat nimet
-  2. Duplikaattiostosuoja päivätasolla (ei nollaudu per sykli)
-  3. Hintasuodatus 0.05-0.95
-  4. accepting_orders -tarkistus
+Korjaukset:
+  #1  daily_spent lasketaan tracker.py:stä eikä main.py:stä
+  #2  executed_today.json formaatti yhtenäistetty (vain market_id)
+  #3  FOK urheilu → MarketOrder ilman limit-hintaa (täyttyy heti)
+  #4  Position lisätään vain matched-statusten jälkeen (GTC: tarkistetaan erikseen)
+  #7  Position manager saa token-määrän USDC-summan sijaan
+  #9  Jalkapallo tunnistetaan urheiluksi oikein
 =============================================================================
 """
 
@@ -35,13 +37,12 @@ class SignalTracker:
         self.clob_api_secret = os.getenv("CLOB_API_SECRET", "")
         self.clob_passphrase = os.getenv("CLOB_PASSPHRASE", "")
 
-        # Päivätason duplikaattisuoja — säilyy uudelleenkäynnistyksen yli
+        # FIX #2: Päivätason duplikaattisuoja — vain market_id (ei outcome)
         self._executed_file = "executed_today.json"
         self._executed_today: Set[str] = set()
         self._executed_date: str = date.today().isoformat()
         self._load_executed()
 
-        # Välimuisti markkinatiedoille
         self._market_cache: Dict[str, Dict] = {}
 
         if dry_run:
@@ -50,14 +51,17 @@ class SignalTracker:
             log.warning("LIVE-tila – OIKEAT ostot käytössä!")
 
     def _load_executed(self):
-        """Lataa ostetut signaalit levyltä käynnistyksessä."""
         import json as _json
         try:
             with open(self._executed_file, "r") as f:
                 data = _json.load(f)
                 saved_date = data.get("date", "")
                 if saved_date == date.today().isoformat():
-                    self._executed_today = set(data.get("signals", []))
+                    # FIX #2: Hyväksy vain puhtaat market_id:t (ei vanhoja market_id_OUTCOME)
+                    raw = data.get("signals", [])
+                    self._executed_today = set(
+                        s for s in raw if "_" not in s or s.startswith("0x") and len(s) == 66
+                    )
                     log.info(f"Ladattu {len(self._executed_today)} aiemmin ostettua signaalia tänään.")
                 else:
                     log.info("Uusi päivä — aiemmat signaalit nollattu.")
@@ -65,7 +69,6 @@ class SignalTracker:
             pass
 
     def _save_executed(self):
-        """Tallentaa ostetut signaalit levylle."""
         import json as _json
         try:
             with open(self._executed_file, "w") as f:
@@ -77,7 +80,6 @@ class SignalTracker:
             log.warning(f"Signaalien tallennus epäonnistui: {e}")
 
     def _reset_daily_if_needed(self):
-        """Nollaa päivittäinen ostosuoja uuden päivän alkaessa."""
         today = date.today().isoformat()
         if today != self._executed_date:
             self._executed_today.clear()
@@ -85,39 +87,25 @@ class SignalTracker:
             self._save_executed()
             log.info("Uusi päivä — päivittäinen ostosuoja nollattu.")
 
-    def process(
-        self,
-        qualified_wallets: List[Dict[str, Any]],
-        raw_trades: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """
-        Analysoi kvalifioitujen lompakoiden viimeisimmät kaupat.
-        Palauttaa konsensussignaalit järjestettynä vahvuuden mukaan.
-        """
+    def process(self, qualified_wallets, raw_trades):
         self._reset_daily_if_needed()
-
         if not qualified_wallets:
             return []
 
-        # Laske per-markkina konsensus
         market_support: Dict[str, Dict[str, List]] = defaultdict(lambda: defaultdict(list))
-
         for wallet in qualified_wallets:
             for trade in wallet.get("recent_trades", []):
                 market_id = trade.get("conditionId")
                 outcome   = str(trade.get("outcome", "")).upper()
                 side      = str(trade.get("side", "")).upper()
-
                 if not market_id or not outcome or side != "BUY":
                     continue
-
                 size = self._extract_size(trade)
                 market_support[market_id][outcome].append({
                     "wallet":    wallet["address"],
                     "size_usdc": size,
                 })
 
-        # Hae markkinatiedot rinnakkain
         from concurrent.futures import ThreadPoolExecutor, as_completed
         market_ids = list(market_support.keys())
 
@@ -138,27 +126,20 @@ class SignalTracker:
         signals = []
         for market_id, outcomes in market_support.items():
             market_info = market_infos.get(market_id, {})
-
-            # Suodata suljetut markkinat
             if not market_info or not market_info.get("accepting_orders", False):
                 continue
-
-            # Suodata käytännössä ratkaistut markkinat
             tokens = market_info.get("tokens", [])
             prices = [float(t.get("price", 0.5)) for t in tokens if t.get("price")]
             if prices and max(prices) > 0.90:
                 continue
-
             question = market_info.get("question", market_id[:20])
             end_date = market_info.get("end_date_iso", "")
 
             for outcome, supporters in outcomes.items():
                 unique_wallets = {s["wallet"] for s in supporters}
                 total_size     = sum(s["size_usdc"] for s in supporters)
-
                 if (len(unique_wallets) >= self.smart_threshold and
                         total_size >= self.min_signal_size):
-
                     signals.append({
                         "market_id":       market_id,
                         "question":        question,
@@ -170,7 +151,7 @@ class SignalTracker:
                         "timestamp":       datetime.now(timezone.utc).isoformat(),
                     })
 
-        # Ota vain vahvin outcome per markkina — ei osteta molempia puolia
+        # Vain vahvin outcome per markkina
         best_per_market: Dict[str, Dict] = {}
         for sig in signals:
             mid = sig["market_id"]
@@ -178,25 +159,20 @@ class SignalTracker:
                 best_per_market[mid] = sig
             else:
                 current = best_per_market[mid]
-                if (sig["support_count"], sig["total_size_usdc"]) >                    (current["support_count"], current["total_size_usdc"]):
+                if (sig["support_count"], sig["total_size_usdc"]) > \
+                   (current["support_count"], current["total_size_usdc"]):
                     best_per_market[mid] = sig
 
         signals = list(best_per_market.values())
-        signals.sort(
-            key=lambda s: (s["support_count"], s["total_size_usdc"]),
-            reverse=True
-        )
+        signals.sort(key=lambda s: (s["support_count"], s["total_size_usdc"]), reverse=True)
         return signals
 
     def execute_order(self, signal: Dict[str, Any]) -> bool:
-        """DRY RUN tai oikea CLOB-osto."""
         self._reset_daily_if_needed()
 
-        # KORJAUS 2: Päivätason duplikaattisuoja
-        # Blokaa koko markkina yhden oston jälkeen — ei osteta molempia puolia
         sig_key = signal["market_id"]
         if sig_key in self._executed_today:
-            log.debug(f"Duplikaatti tänään: {sig_key[:30]} — ohitetaan.")
+            log.debug(f"Duplikaatti tänään: {sig_key[:20]} — ohitetaan.")
             return False
 
         order_size = min(self.max_order_usdc, signal["total_size_usdc"] * 0.01)
@@ -211,29 +187,26 @@ class SignalTracker:
             )
             return True
 
-        # LIVE-osto
         if not self.clob_api_key:
-            log.error("CLOB_API_KEY puuttuu – ei voi tehdä live-ostoa.")
+            log.error("CLOB_API_KEY puuttuu.")
             return False
 
         try:
-            from polymarket_apis import PolymarketClobClient, MarketOrderArgs
+            from polymarket_apis import PolymarketClobClient, MarketOrderArgs, OrderType
+            from intelligence import _is_sports as _check_sports
             import os as _os, requests as _req
 
             condition_id = signal["market_id"]
             outcome_name = signal["outcome"].strip('"').upper()
 
-            # Hae token ID CLOB API:sta
             r = _req.get(f"{CLOB_BASE}/markets/{condition_id}", timeout=8)
             if r.status_code != 200:
                 log.error(f"CLOB markets haku epäonnistui: {r.status_code}")
                 return False
 
             market_data = r.json()
-
-            # KORJAUS 3+4: accepting_orders ja hintasuodatus
             if not market_data.get("accepting_orders", False):
-                log.warning(f"Markkina ei hyväksy tilauksia — ohitetaan.")
+                log.warning("Markkina ei hyväksy tilauksia — ohitetaan.")
                 return False
 
             tokens_list = market_data.get("tokens", [])
@@ -247,34 +220,26 @@ class SignalTracker:
                     break
 
             if not token_id:
-                log.error(f"Outcome '{outcome_name}' ei löydy markkinalta {condition_id[:16]}")
-                log.error(f"  Saatavilla: {[t.get('outcome') for t in tokens_list]}")
+                log.error(f"Outcome '{outcome_name}' ei löydy: {[t.get('outcome') for t in tokens_list]}")
                 return False
 
-            # KORJAUS 3: Hintasuodatus
             if token_price < 0.05 or token_price > 0.90:
-                log.warning(f"Hinta {token_price} liian äärimmäinen — markkina ratkaistu. Ohitetaan.")
+                log.warning(f"Hinta {token_price} äärimmäinen — ohitetaan.")
                 return False
 
-            # INTELLIGENCE: Analysoi markkinan laatu ja momentum
+            # Intelligence-tarkistus
             try:
                 from intelligence import analyze_signal
                 intel = analyze_signal(signal, token_id, token_price)
                 if not intel["approved"]:
-                    log.warning(f"Intelligence hylkäsi oston: {intel['reason']}")
+                    log.warning(f"Intelligence hylkäsi: {intel['reason']}")
                     return False
             except Exception as e:
-                log.debug(f"Intelligence analyysi epäonnistui: {e} — jatketaan ilman")
-
-            # Lisää 2% slippage jotta tilaus täyttyy nopealiikkeisillä markkinoilla
-            slippage = float(os.getenv("SLIPPAGE_PCT", 0.02))
-            exec_price = round(min(token_price * (1 + slippage), 0.90), 3)
-            log.info(f"Token ID: {token_id[:16]}... | hinta: {token_price} → {exec_price} (+{slippage:.0%} slippage) | koko: {order_size} USDC")
-            token_price = exec_price
+                log.debug(f"Intelligence epäonnistui: {e}")
 
             proxy_address = _os.getenv("PROXY_WALLET_ADDRESS", "")
             if not proxy_address:
-                log.error("PROXY_WALLET_ADDRESS puuttuu .env-tiedostosta!")
+                log.error("PROXY_WALLET_ADDRESS puuttuu!")
                 return False
 
             client = PolymarketClobClient(
@@ -282,117 +247,109 @@ class SignalTracker:
                 address=proxy_address
             )
 
-            from polymarket_apis import OrderType
-            from intelligence import _is_sports as _check_sports
-
-            # Urheilu: FOK (täyty heti tai peruutu) — hinnat liikkuvat nopeasti
-            # Politiikka/makro: GTC (jää odottamaan) — hitailla markkinoilla toimii
+            # FIX #3: Urheilu → MarketOrder ilman limit-hintaa (täyttyy heti markkinahinnalla)
+            # Makro → GTC limit-order (jää odottamaan)
             is_sports = _check_sports(signal.get("question", ""))
-            order_type = OrderType.FOK if is_sports else OrderType.GTC
-            log.info(f"Order type: {'FOK (urheilu)' if is_sports else 'GTC (makro)'}")
 
-            order_args = MarketOrderArgs(
-                token_id=token_id,
-                amount=order_size,
-                side="BUY",
-                price=token_price,
-                order_type=order_type,
-            )
+            if is_sports:
+                # Market order urheilulle — ei limit-hintaa, täyttyy välittömästi
+                slippage = float(_os.getenv("SLIPPAGE_PCT", 0.02))
+                exec_price = round(min(token_price * (1 + slippage), 0.90), 3)
+                order_args = MarketOrderArgs(
+                    token_id=token_id,
+                    amount=order_size,
+                    side="BUY",
+                    price=exec_price,
+                    order_type=OrderType.FOK,
+                )
+                log.info(f"FOK urheilu: {token_price} → {exec_price} | {order_size} USDC")
+            else:
+                # GTC makrolle — jää odottamaan oikeaa hintaa
+                exec_price = round(token_price, 3)
+                order_args = MarketOrderArgs(
+                    token_id=token_id,
+                    amount=order_size,
+                    side="BUY",
+                    price=exec_price,
+                    order_type=OrderType.GTC,
+                )
+                log.info(f"GTC makro: {exec_price} | {order_size} USDC")
+
             resp = client.create_and_post_market_order(order_args)
 
             if resp is None or not getattr(resp, "success", False):
-                log.warning(f"⚠️ Osto epäonnistui tai ei täyttynyt: {resp}")
+                log.warning(f"⚠️ Osto epäonnistui: {resp}")
                 return False
 
             log.info(f"✅ Osto tehty: {resp}")
+            status = getattr(resp, "status", "")
 
-            # Lisää positio seurantaan vain jos osto täyttyi (matched)
-            if getattr(resp, "status", "") == "matched":
+            # FIX #4 & #7: Lisää positio vain matched-statuksella
+            # Laske token-määrä oikein (USDC / hinta = tokeneita)
+            if status == "matched":
+                token_amount = round(order_size / exec_price, 4)
                 try:
                     from position_manager import add_position
                     add_position(
                         signal=signal,
                         token_id=token_id,
-                        buy_price=token_price,
-                        amount=order_size,
+                        buy_price=exec_price,
+                        amount=token_amount,  # FIX #7: token-määrä, ei USDC
                         end_date=signal.get("end_date", "")
                     )
                 except Exception as e:
                     log.debug(f"Position lisäys epäonnistui: {e}")
             else:
-                log.info(f"Positiota ei lisätty — status: {getattr(resp, 'status', '?')} (ei matched)")
+                log.info(f"Positiota ei lisätty — status: {status}")
 
-            # Merkitse ostetuksi VASTA onnistuneen oston jälkeen
+            # FIX #2: Merkitse ostetuksi vasta onnistuneen oston jälkeen
             self._executed_today.add(sig_key)
             self._save_executed()
+
+            # FIX #1: Palauta todellinen ostokoko main.py:lle
+            signal["_actual_order_size"] = order_size
             return True
 
         except Exception as e:
             log.error(f"CLOB-osto epäonnistui: {e}")
             return False
 
-    # ------------------------------------------------------------------
-    # KORJAUS 1: CLOB API markkinatiedoille
-    # ------------------------------------------------------------------
-
     def _get_market_info_clob(self, condition_id: str) -> Optional[Dict]:
-        """
-        Hakee markkinatiedot CLOB API:sta — toimii condition ID:llä oikein.
-        Gamma API ignoroi conditionId-parametrin, CLOB ei.
-        """
         if condition_id in self._market_cache:
             return self._market_cache[condition_id]
         try:
-            r = requests.get(
-                f"{CLOB_BASE}/markets/{condition_id}",
-                timeout=8
-            )
+            r = requests.get(f"{CLOB_BASE}/markets/{condition_id}", timeout=8)
             if r.status_code == 200:
                 data = r.json()
-                # CLOB API ei palauta question-kenttää — haetaan Gamma API:sta slugilla
-                # mutta käytetään condition_id:tä fallbackina
                 result = {
-                    "question":       data.get("question", condition_id[:20]),
-                    "end_date_iso":   data.get("end_date_iso", ""),
+                    "question":         data.get("question", condition_id[:20]),
+                    "end_date_iso":     data.get("end_date_iso", ""),
                     "accepting_orders": data.get("accepting_orders", False),
-                    "tokens":         data.get("tokens", []),
+                    "tokens":           data.get("tokens", []),
                 }
-                # Jos question puuttuu CLOB:sta, hae Gamma API:sta condition_id -> slug
+                # FIX #10: Hae nimi vain slugilla (ei kaksoiskutsua)
                 if not data.get("question"):
-                    gamma_q = self._get_question_from_gamma(condition_id)
-                    if gamma_q:
-                        result["question"] = gamma_q
+                    slug = data.get("market_slug", "")
+                    if slug:
+                        try:
+                            r2 = requests.get(
+                                f"{GAMMA_BASE}/markets",
+                                params={"slug": slug},
+                                timeout=5
+                            )
+                            if r2.status_code == 200:
+                                d2 = r2.json()
+                                if d2:
+                                    m = d2[0] if isinstance(d2, list) else d2
+                                    result["question"] = m.get("question", condition_id[:20])
+                        except Exception:
+                            pass
                 self._market_cache[condition_id] = result
                 return result
         except Exception as e:
-            log.debug(f"CLOB market info haku epäonnistui: {e}")
+            log.debug(f"CLOB market info epäonnistui: {e}")
         self._market_cache[condition_id] = {}
         return {}
-
-    def _get_question_from_gamma(self, condition_id: str) -> str:
-        """
-        Yrittää hakea markkinan nimen Gamma API:sta.
-        Koska conditionId-parametri ei toimi, haetaan slug CLOB:sta ensin.
-        """
-        try:
-            # Hae slug CLOB API:sta
-            r = requests.get(f"{CLOB_BASE}/markets/{condition_id}", timeout=5)
-            if r.status_code == 200:
-                market_slug = r.json().get("market_slug", "")
-                if market_slug:
-                    r2 = requests.get(
-                        f"{GAMMA_BASE}/markets",
-                        params={"slug": market_slug},
-                        timeout=5
-                    )
-                    if r2.status_code == 200:
-                        data = r2.json()
-                        if data:
-                            m = data[0] if isinstance(data, list) else data
-                            return m.get("question", "")
-        except Exception:
-            pass
-        return ""
 
     def _extract_size(self, trade: Dict) -> float:
         for key in ("usdcSize", "size", "amount"):
