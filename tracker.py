@@ -283,12 +283,20 @@ class SignalTracker:
             )
 
             from polymarket_apis import OrderType
+            from intelligence import _is_sports as _check_sports
+
+            # Urheilu: FOK (täyty heti tai peruutu) — hinnat liikkuvat nopeasti
+            # Politiikka/makro: GTC (jää odottamaan) — hitailla markkinoilla toimii
+            is_sports = _check_sports(signal.get("question", ""))
+            order_type = OrderType.FOK if is_sports else OrderType.GTC
+            log.info(f"Order type: {'FOK (urheilu)' if is_sports else 'GTC (makro)'}")
+
             order_args = MarketOrderArgs(
                 token_id=token_id,
                 amount=order_size,
                 side="BUY",
                 price=token_price,
-                order_type=OrderType.GTC,  # Good Till Cancelled — jää open orderiksi
+                order_type=order_type,
             )
             resp = client.create_and_post_market_order(order_args)
 
