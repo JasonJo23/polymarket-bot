@@ -350,10 +350,17 @@ class SignalTracker:
 
             self._executed_today.add(sig_key)
             self._save_executed()
-            signal["_actual_order_size"] = order_size
+            if status == "matched":
+                signal["_actual_order_size"] = order_size
+            else:
+                signal["_actual_order_size"] = 0
             return True
 
         except Exception as e:
+            err = str(e)
+            if "fully filled or killed" in err or "FOK" in err:
+                log.info("FOK ei täyttynyt — normaali tilanne, ohitetaan.")
+                return False
             log.error(f"CLOB-osto epäonnistui: {e}")
             return False
 
