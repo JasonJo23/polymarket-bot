@@ -37,13 +37,8 @@ log = logging.getLogger("Scout")
 
 def get_bankroll_usdc() -> float:
     try:
-        from polymarket_apis import PolymarketClobClient
-        proxy = os.getenv("PROXY_WALLET_ADDRESS", "")
-        key   = os.getenv("PRIVATE_KEY", "")
-        if not proxy or not key:
-            return float(os.getenv("CURRENT_BANKROLL_USDC", 100.0))
-        client = PolymarketClobClient(private_key=key, address=proxy)
-        return float(client.get_usdc_balance())
+        from tracker import get_usdc_balance_v2
+        return get_usdc_balance_v2()
     except Exception as e:
         log.warning(f"Saldon haku epäonnistui: {e}")
         return float(os.getenv("CURRENT_BANKROLL_USDC", 100.0))
