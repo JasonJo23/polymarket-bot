@@ -167,7 +167,9 @@ class PolymarketFetcher:
 
             vol = float(m.get("volume24hr") or m.get("volume") or 0)
 
-            if now <= end_dt <= limit and vol >= self.min_volume_24h:
+            # Suodata pois markkinat jotka sulkeutuvat alle 1 tunnin päästä
+            hours_left = (end_dt - now).total_seconds() / 3600
+            if now <= end_dt <= limit and vol >= self.min_volume_24h and hours_left >= 1.0:
                 closing_soon.append(m)
 
         # Järjestä volyymilla
