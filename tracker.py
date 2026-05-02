@@ -238,14 +238,37 @@ class SignalTracker:
             token_price = 0.5
             tick_size   = "0.01"
 
+            def _normalize(s):
+                """Normalisoi outcome-nimi vertailua varten."""
+                import re
+                s = s.upper()
+                s = s.replace("'", "").replace("'", "").replace("`", "")
+                s = re.sub(r'[^A-Z0-9 ]', ' ', s)
+                s = re.sub(r'\s+', ' ', s).strip()
+                return s
+
+            outcome_norm = _normalize(outcome_name)
+
             for token in tokens_list:
-                t_outcome = str(token.get("outcome", "")).upper()
-                # Fuzzy match: vertaa normalisoituja nimiä
-                if t_outcome == outcome_name or \
-                   t_outcome.replace("'", "").replace(" ", "") == outcome_name.replace("'", "").replace(" ", ""):
+                t_outcome = str(token.get("outcome", ""))
+                t_norm = _normalize(t_outcome)
+
+                # Täsmällinen match tai normalisoitu match
+                if t_norm == outcome_norm or t_norm.replace(" ", "") == outcome_norm.replace(" ", ""):
                     token_id    = token.get("token_id")
                     token_price = round(float(token.get("price", 0.5)), 3)
                     break
+
+            # Jos ei löydy — kokeile osittaista matchausta
+            if not token_id:
+                for token in tokens_list:
+                    t_norm = _normalize(str(token.get("outcome", "")))
+                    # Tarkista onko outcome_norm osa token-nimeä tai päinvastoin
+                    if outcome_norm in t_norm or t_norm in outcome_norm:
+                        token_id    = token.get("token_id")
+                        token_price = round(float(token.get("price", 0.5)), 3)
+                        log.info(f"Fuzzy match: '{outcome_name}' → '{token.get('outcome')}'")
+                        break
 
             if not token_id:
                 log.error(f"Outcome '{outcome_name}' ei löydy: {[t.get('outcome') for t in tokens_list]}")
