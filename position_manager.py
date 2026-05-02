@@ -149,21 +149,19 @@ def _sell_position_v2(
 
 
 def _evaluate_sports_position(position: Dict) -> Tuple[bool, str]:
-    buy_price     = float(position.get("buy_price", 0.5))
+    """
+    Urheilu: Hold to resolution — Polymarket maksaa 1.00 automaattisesti.
+    Myydään vain kahdessa tilanteessa:
+      1. Hinta alle 0.10 → peli selvästi hävitty, pelastetaan loput
+      2. Hinta yli 0.92 → peli selvästi voitettu, lukitaan voitto
+    Ei time exittejä, ei TP% laskentaa — pidetään loppuun.
+    """
     current_price = float(position.get("current_price", 0.5))
-    hours_left    = float(position.get("hours_left", 24))
-    pnl_pct = (current_price - buy_price) / buy_price if buy_price > 0 else 0
 
-    if pnl_pct >= 0.30:
-        return True, f"Urheilu TP +30% ({pnl_pct:+.1%})"
-    if current_price >= 0.85:
-        return True, f"Urheilu peli voitettu ({current_price:.2f} ≥ 0.85)"
-    if pnl_pct <= -0.35:
-        return True, f"Urheilu SL -35% ({pnl_pct:+.1%})"
-    if current_price <= 0.15:
-        return True, f"Urheilu peli hävitty ({current_price:.2f} ≤ 0.15)"
-    if hours_left <= 0.5 and pnl_pct > 0:
-        return True, f"Urheilu time exit <30min, voitolla {pnl_pct:+.1%}"
+    if current_price >= 0.92:
+        return True, f"Urheilu peli voitettu ({current_price:.2f} ≥ 0.92) — lukitaan voitto"
+    if current_price <= 0.10:
+        return True, f"Urheilu peli hävitty ({current_price:.2f} ≤ 0.10) — pelastetaan loput"
 
     return False, ""
 
