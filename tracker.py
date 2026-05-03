@@ -173,6 +173,15 @@ class SignalTracker:
                 except Exception:
                     pass
 
+        # Wallet scoring — hae painot historiallisen win raten perusteella
+        wallet_scores = {}
+        try:
+            from wallet_scorer import score_wallets_batch
+            history_cache = {w["address"].lower(): w.get("all_trades", []) for w in qualified_wallets}
+            wallet_scores = score_wallets_batch(qualified_wallets, history_cache)
+        except Exception as e:
+            log.debug(f"Wallet scoring epäonnistui: {e}")
+
         signals = []
         for market_id, outcomes in market_support.items():
             market_info = market_infos.get(market_id, {})
@@ -188,17 +197,25 @@ class SignalTracker:
             for outcome, supporters in outcomes.items():
                 unique_wallets = {s["wallet"] for s in supporters}
                 total_size     = sum(s["size_usdc"] for s in supporters)
+
+                # Laske painotettu support count wallet scoren perusteella
+                weighted_support = sum(
+                    wallet_scores.get(w, {}).get("weight", 1.0)
+                    for w in unique_wallets
+                )
+
                 if (len(unique_wallets) >= self.smart_threshold and
                         total_size >= self.min_signal_size):
                     signals.append({
-                        "market_id":       market_id,
-                        "question":        question,
-                        "end_date":        end_date[:10] if end_date else "?",
-                        "outcome":         outcome,
-                        "support_count":   len(unique_wallets),
-                        "supporters":      list(unique_wallets),
-                        "total_size_usdc": total_size,
-                        "timestamp":       datetime.now(timezone.utc).isoformat(),
+                        "market_id":        market_id,
+                        "question":         question,
+                        "end_date":         end_date[:10] if end_date else "?",
+                        "outcome":          outcome,
+                        "support_count":    len(unique_wallets),
+                        "weighted_support": round(weighted_support, 2),
+                        "supporters":       list(unique_wallets),
+                        "total_size_usdc":  total_size,
+                        "timestamp":        datetime.now(timezone.utc).isoformat(),
                     })
 
         best_per_market: Dict[str, Dict] = {}
