@@ -75,41 +75,67 @@ class SignalTracker:
             log.warning("LIVE-tila – OIKEAT ostot käytössä!")
 
     def _load_executed(self):
+        """
+        FIX: Muisti säilyy 48h — ei nollaudu yöllä.
+        Estää saman markkinan ostamisen uudelleen kun päivä vaihtuu.
+        """
         import json as _json
+        from datetime import datetime, timedelta
         try:
             with open(self._executed_file, "r") as f:
                 data = _json.load(f)
-                if data.get("date", "") == date.today().isoformat():
-                    raw = data.get("signals", [])
-                    # Hyväksy vain puhtaat market_id:t
-                    self._executed_today = set(
-                        s for s in raw
-                        if s.startswith("0x") and "_" not in s
-                    )
-                    log.info(f"Ladattu {len(self._executed_today)} aiemmin ostettua signaalia tänään.")
-                else:
-                    log.info("Uusi päivä — aiemmat signaalit nollattu.")
+                # Lataa kaikki signaalit jotka on ostettu viimeisen 48h aikana
+                signals = data.get("signals", [])
+                if isinstance(signals, list) and signals:
+                    # Uusi formaatti: lista dictionaryja timestampilla
+                    if isinstance(signals[0], dict):
+                        cutoff = (datetime.now() - timedelta(hours=48)).isoformat()
+                        self._executed_today = set(
+                            s["market_id"] for s in signals
+                            if s.get("bought_at", "") > cutoff
+                        )
+                    else:
+                        # Vanha formaatti: pelkkiä market_id stringejä
+                        self._executed_today = set(
+                            s for s in signals
+                            if s.startswith("0x") and "_" not in s
+                        )
+                log.info(f"Ladattu {len(self._executed_today)} ostettua signaalia (48h muisti).")
         except (FileNotFoundError, Exception):
             pass
 
     def _save_executed(self):
+        """Tallentaa ostetut signaalit timestampilla."""
         import json as _json
+        from datetime import datetime
         try:
+            # Lataa vanhat
+            try:
+                with open(self._executed_file, "r") as f:
+                    data = _json.load(f)
+                    existing = data.get("signals", [])
+                    if existing and isinstance(existing[0], str):
+                        existing = []  # Konvertoi vanha formaatti
+            except Exception:
+                existing = []
+
+            # Lisää uudet merkinnät
+            existing_ids = {s.get("market_id") for s in existing if isinstance(s, dict)}
+            for market_id in self._executed_today:
+                if market_id not in existing_ids:
+                    existing.append({
+                        "market_id": market_id,
+                        "bought_at": datetime.now().isoformat()
+                    })
+
             with open(self._executed_file, "w") as f:
-                _json.dump({
-                    "date": self._executed_date,
-                    "signals": list(self._executed_today)
-                }, f)
+                _json.dump({"signals": existing}, f)
         except Exception as e:
             log.warning(f"Signaalien tallennus epäonnistui: {e}")
 
     def _reset_daily_if_needed(self):
-        today = date.today().isoformat()
-        if today != self._executed_date:
-            self._executed_today.clear()
-            self._executed_date = today
-            self._save_executed()
-            log.info("Uusi päivä — päivittäinen ostosuoja nollattu.")
+        """FIX: Ei enää nollaa yöllä — 48h muisti hoitaa vanhenemisen."""
+        pass  # Muisti vanhenee automaattisesti _load_executed:ssa
 
     def process(self, qualified_wallets, raw_trades):
         self._reset_daily_if_needed()
@@ -195,8 +221,26 @@ class SignalTracker:
 
         sig_key = signal["market_id"]
         if sig_key in self._executed_today:
-            log.debug(f"Duplikaatti tänään: {sig_key[:20]} — ohitetaan.")
+            log.debug(f"Duplikaatti (48h muisti): {sig_key[:20]} — ohitetaan.")
             return False
+
+        # FIX 2: Tarkista onko vastakkainen positio jo auki
+        try:
+            import json as _j
+            with open("open_positions.json", "r") as f:
+                open_pos = _j.load(f).get("positions", [])
+            for pos in open_pos:
+                if pos.get("market_id") == sig_key:
+                    existing_outcome = pos.get("outcome", "")
+                    new_outcome = signal.get("outcome", "")
+                    if existing_outcome != new_outcome:
+                        log.warning(f"Vastakkainen positio auki: {existing_outcome} vs {new_outcome} — ohitetaan.")
+                        return False
+                    else:
+                        log.debug(f"Sama positio jo auki: {existing_outcome} — ohitetaan.")
+                        return False
+        except Exception:
+            pass
 
         order_size = min(self.max_order_usdc, signal["total_size_usdc"] * 0.01)
         order_size = max(round(order_size, 2), 1.0)
