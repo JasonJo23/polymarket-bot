@@ -1,24 +1,18 @@
 """
 =============================================================================
-fetcher.py – PolymarketFetcher  (v5.0 – Closing Soon -strategia)
+fetcher.py – PolymarketFetcher  (v6.0 – HISTORY_LIMIT_PER_WALLET)
 =============================================================================
-STRATEGIA:
-  Vanha ongelma: top-holderit operoivat avoimilla markkinoilla
-  → win rate -laskenta mahdotonta (ei suljettua dataa)
+KORJAUKSET v5.0 → v6.0:
 
-  Uusi ratkaisu:
-  1. Hae markkinat jotka sulkeutuvat seuraavan N päivän sisällä
-     JA joilla on korkea volyymi (smart money on jo sisällä)
-  2. Hae näiden markkinoiden top-holderit
-  3. Hae jokaisen holderin KOKO historia (myös vanhat markkinat)
-  4. Analyzer laskee win raten suljetuista historiallisista markkinoista
-  5. Scout seuraa holdereita joilla on todistettu track record
+  PERF #1  limit=500 kovakoodattu per lompakko
+           → 250 lompakkoa × 500 = 125 000 kauppaa haettavana
+           → Käytännössä 48h dataan riittää 100 kauppaa
+           → KORJAUS: luetaan HISTORY_LIMIT_PER_WALLET .env:stä
+             oletus 100 (aiempi 500)
 
-TESTATUT ENDPOINTIT:
-  ✅ GET gamma-api.polymarket.com/markets
-       params: active, closed, order, ascending, limit
-  ✅ GET data-api.polymarket.com/holders?market=conditionId
-  ✅ GET data-api.polymarket.com/activity?user=0x...
+  PERF #2  Historia-haku hakee kaiken vaikka tarvitaan vain 48h
+           → recent-suodatus tehdään JÄLKEEN haun
+           → Ei muutosta logiikkaan mutta pienempi limit auttaa
 =============================================================================
 """
 
@@ -42,14 +36,15 @@ class PolymarketFetcher:
         self.session = requests.Session()
         self.session.headers.update({
             "Accept":     "application/json",
-            "User-Agent": "PolymarketScout/5.0"
+            "User-Agent": "PolymarketScout/6.0"
         })
-        self.request_delay    = float(os.getenv("REQUEST_DELAY_SECONDS", 1.5))
-        self.max_retries      = int(os.getenv("MAX_RETRIES", 3))
-        self.top_markets      = int(os.getenv("TOP_MARKETS", 15))
-        self.top_holders      = int(os.getenv("TOP_HOLDERS", 20))
-        self.closing_days     = int(os.getenv("CLOSING_DAYS", 7))      # markkinat jotka sulkeutuvat N päivän sisällä
-        self.min_volume_24h   = float(os.getenv("MIN_VOLUME_24H", 50000))  # min volyymi USDC
+        self.request_delay        = float(os.getenv("REQUEST_DELAY_SECONDS", 0.3))
+        self.max_retries          = int(os.getenv("MAX_RETRIES", 3))
+        self.top_markets          = int(os.getenv("TOP_MARKETS", 10))
+        self.top_holders          = int(os.getenv("TOP_HOLDERS", 15))
+        self.closing_days         = int(os.getenv("CLOSING_DAYS", 3))
+        self.min_volume_24h       = float(os.getenv("MIN_VOLUME_24H", 50000))
+        self.history_limit        = int(os.getenv("HISTORY_LIMIT_PER_WALLET", 100))  # PERF #1
         self._history_cache: Dict[str, List[Dict]] = {}
 
     # ------------------------------------------------------------------
@@ -61,12 +56,12 @@ class PolymarketFetcher:
         Closing Soon -strategia:
           1. Hae korkeavolyymiset markkinat jotka sulkeutuvat pian
           2. Kerää top-holderit näiltä markkinoilta
-          3. Hae jokaisen holderin koko historia win rate -laskentaa varten
+          3. Hae jokaisen holderin historia (HISTORY_LIMIT_PER_WALLET kauppaa)
           4. Palauta viimeiset 48h kaupat analyysiin
         """
         self._history_cache.clear()
 
-        # Vaihe 1: Pian sulkeutuvat korkeavolyymiset markkinat
+        # Vaihe 1: Pian sulkeutuvat markkinat
         markets = self._fetch_closing_soon_markets()
         if not markets:
             log.warning("Ei sopivia markkinoita – kokeillaan top-volyymi ilman aikarajoitusta.")
@@ -86,12 +81,13 @@ class PolymarketFetcher:
         if not wallets:
             return []
 
-        # Vaihe 3: Historia rinnakkain (ThreadPoolExecutor)
-        cutoff     = datetime.now(timezone.utc) - timedelta(hours=hours_back)
+        # Vaihe 3: Historia rinnakkain
+        cutoff      = datetime.now(timezone.utc) - timedelta(hours=hours_back)
         all_recent: List[Dict] = []
 
         def fetch_one(wallet: str):
-            history = self._fetch_wallet_activity(wallet, limit=500)
+            # PERF #1 KORJAUS: käytetään history_limit eikä kovakoodattua 500
+            history = self._fetch_wallet_activity(wallet, limit=self.history_limit)
             recent  = [
                 t for t in history
                 if self._ts(t) is not None and self._ts(t) >= cutoff
@@ -100,8 +96,11 @@ class PolymarketFetcher:
                 t.setdefault("proxyWallet", wallet)
             return wallet, history, recent
 
-        max_workers = int(os.getenv("FETCH_WORKERS", 8))
-        log.info(f"Haetaan {len(wallets)} lompakon historia ({max_workers} rinnakkain)...")
+        max_workers = int(os.getenv("FETCH_WORKERS", 16))
+        log.info(
+            f"Haetaan {len(wallets)} lompakon historia "
+            f"({max_workers} rinnakkain, limit={self.history_limit}/lompakko)..."
+        )
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(fetch_one, w): w for w in wallets}
@@ -133,13 +132,10 @@ class PolymarketFetcher:
         - Ovat aktiivisia ja avoimia
         - Sulkeutuvat seuraavan CLOSING_DAYS päivän sisällä
         - Volyymi yli MIN_VOLUME_24H
-
-        Järjestetään volyymilla — smart money on jo sisällä.
         """
         now   = datetime.now(timezone.utc)
         limit = now + timedelta(days=self.closing_days)
 
-        # Hae suurivolyymiset markkinat ja suodata päätymispäivän mukaan
         data = self._get(f"{GAMMA_BASE}/markets", {
             "limit":     50,
             "active":    "true",
@@ -165,18 +161,19 @@ class PolymarketFetcher:
             except ValueError:
                 continue
 
-            vol = float(m.get("volume24hr") or m.get("volume") or 0)
-
-            # Suodata pois markkinat jotka sulkeutuvat alle 1 tunnin päästä
+            vol        = float(m.get("volume24hr") or m.get("volume") or 0)
             hours_left = (end_dt - now).total_seconds() / 3600
+
             if now <= end_dt <= limit and vol >= self.min_volume_24h and hours_left >= 1.0:
                 closing_soon.append(m)
 
-        # Järjestä volyymilla
         closing_soon.sort(key=lambda x: float(x.get("volume24hr") or 0), reverse=True)
         result = closing_soon[:self.top_markets]
 
-        log.info(f"Pian sulkeutuvia markkinoita ({self.closing_days}pv, >{self.min_volume_24h:.0f} USDC): {len(result)}")
+        log.info(
+            f"Pian sulkeutuvia markkinoita "
+            f"({self.closing_days}pv, >{self.min_volume_24h:.0f} USDC): {len(result)}"
+        )
         return result
 
     def _fetch_top_markets_fallback(self) -> List[Dict]:
@@ -217,8 +214,8 @@ class PolymarketFetcher:
 
         return list(wallets)
 
-    def _fetch_wallet_activity(self, wallet: str, limit: int = 500) -> List[Dict]:
-        """Hakee lompakon täyden kauppahistorian."""
+    def _fetch_wallet_activity(self, wallet: str, limit: int = 100) -> List[Dict]:
+        """Hakee lompakon kauppahistorian."""
         data = self._get(f"{DATA_BASE}/activity", {
             "user":          wallet,
             "type":          "TRADE",
