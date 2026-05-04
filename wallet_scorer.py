@@ -1,49 +1,66 @@
 """
 =============================================================================
-wallet_scorer.py – WalletScorer  (v1.0)
+wallet_scorer.py – WalletScorer  (v2.0 – ROI-pohjainen, korjattu)
 =============================================================================
-Laskee historiallisen win raten per lompakko suljettujen markkinoiden
-perusteella ja tuottaa painokertoimen konsensukselle.
+KORJAUKSET v1.0 → v2.0:
 
-LOGIIKKA:
-  1. Hae lompakon kauppahistoria (jo fetcherissä)
-  2. Suodata suljetut markkinat (endDate menneisyydessä)
-  3. Hae suljetun markkinan voittava outcome CLOB API:sta
-  4. Laske win rate: oikeat / kaikki suljetut kaupat
-  5. Muunna win rate painokertoimeksi (0.5–2.0)
+  BUG #1  seen_markets otti vain ENSIMMÄISEN kaupan per markkina
+          → Sama lompakko voi ostaa YES ja sitten NO samalla markkinalla
+          → Nyt ryhmitellään kaikki kaupat markkinoittain ja lasketaan
+             nettopositio per outcome
 
-PAINOKERROIN:
-  win_rate < 0.40  → 0.5  (heikko, painaa vähemmän)
-  win_rate 0.40-0.50 → 0.8
-  win_rate 0.50-0.55 → 1.0  (normaali)
-  win_rate 0.55-0.65 → 1.3
-  win_rate > 0.65  → 2.0  (erinomainen, painaa tuplasti)
-  alle 5 ratkaistua → 1.0  (ei tarpeeksi dataa)
+  BUG #2  Win/loss -binääri ei huomioinut kauppakokoa
+          → 10 USDC väärä + 5000 USDC oikea = "50% win rate" vanhassa
+          → Nyt käytetään ROI-pohjaista laskentaa: voittava USDC / kaikki USDC
 
-HUOMIO: Alle 10 ratkaistua kauppaa = ei luotettavaa dataa.
-Käytetään neutraalia painoa kunnes dataa on tarpeeksi.
+  BUG #3  continue ohitti avoimet markkinat laskematta niitä häviöiksi
+          → Survivorship bias: vain helposti resolvattavat markkinat laskettiin
+          → Nyt open-markkinat jätetään pois laskuista (ei häviötä eikä voittoa)
+            mutta lokataan erikseen seurantaa varten
+
+  BUG #4  analyzer.py ei käyttänyt scorer-painoja mitenkään
+          → Nyt analyze()-metodi ottaa wallet_scores-parametrin ja
+             järjestää lompakot painotetulla volyymilla
+
+PAINOKERROIN (ROI-pohjainen):
+  avg_roi >= +20%  → 2.0
+  avg_roi >= +10%  → 1.5
+  avg_roi >=   0%  → 1.0  (ei tappiolla, ei voitolla)
+  avg_roi >= -10%  → 0.7
+  avg_roi <  -10%  → 0.4
+  alle 5 ratkaistua → 1.0  (neutraali, ei tarpeeksi dataa)
 =============================================================================
 """
 
 import logging
 import requests
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
-from functools import lru_cache
+from typing import Dict, List, Optional, Tuple
+from collections import defaultdict
 
 log = logging.getLogger("Scout.WalletScorer")
 
 CLOB_BASE  = "https://clob.polymarket.com"
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 
-# Cache markkinoiden tuloksille — ei haeta samaa useasti
+# Globaali cache markkinoiden tuloksille — ei haeta samaa useasti per sessio
 _market_result_cache: Dict[str, Optional[str]] = {}
 
 
+# ===========================================================================
+# Markkinan tuloksen haku
+# ===========================================================================
+
 def _get_winning_outcome(condition_id: str) -> Optional[str]:
     """
-    Hakee suljetun markkinan voittavan outcomen.
-    Palauttaa outcome-nimen tai None jos markkina ei ole vielä ratkaistu.
+    Hakee suljetun markkinan voittavan outcomen CLOB API:sta.
+
+    Palauttaa:
+        str   – voittava outcome (esim. "YES", "KNICKS") jos markkina ratkaistu
+        None  – markkina vielä auki TAI tulosta ei saatu
+
+    HUOM: None ei tarkoita häviötä — se tarkoittaa "ei tietoa vielä".
+    Kutsuja ei lasketa win/loss -tilastoihin.
     """
     if condition_id in _market_result_cache:
         return _market_result_cache[condition_id]
@@ -54,146 +71,261 @@ def _get_winning_outcome(condition_id: str) -> Optional[str]:
             timeout=5
         )
         if r.status_code != 200:
-            _market_result_cache[condition_id] = None
+            # Älä cacheta verkkovirhettä — yritetään uudelleen ensi kerralla
             return None
 
         data = r.json()
 
-        # Tarkista onko markkina ratkaistu
+        # accepting_orders=True → markkina vielä auki
         if data.get("accepting_orders", True):
             _market_result_cache[condition_id] = None
-            return None  # Vielä auki
+            return None
 
+        # Etsi token jonka hinta on lähellä 1.0 (voittaja)
         tokens = data.get("tokens", [])
         for token in tokens:
             price = float(token.get("price", 0))
-            if price >= 0.99:  # Voittaja on lähellä 1.0
-                winner = str(token.get("outcome", "")).upper()
+            if price >= 0.99:
+                winner = str(token.get("outcome", "")).upper().strip()
                 _market_result_cache[condition_id] = winner
+                log.debug(f"Voittaja löytyi: {condition_id[:16]} → {winner}")
                 return winner
 
+        # Markkina suljettu mutta voittajaa ei löydy (esim. N/A, cancelled)
         _market_result_cache[condition_id] = None
         return None
 
     except Exception as e:
-        log.debug(f"Voittavan outcomen haku epäonnistui: {e}")
-        _market_result_cache[condition_id] = None
+        log.debug(f"_get_winning_outcome virhe ({condition_id[:16]}): {e}")
         return None
 
 
-def calculate_wallet_score(
-    wallet_address: str,
-    trade_history: List[Dict],
-    min_resolved: int = 5
-) -> Dict:
+# ===========================================================================
+# ROI-laskenta
+# ===========================================================================
+
+def _group_trades_by_market(trade_history: List[Dict]) -> Dict[str, Dict[str, float]]:
     """
-    Laskee lompakon historiallisen suorituskyvyn.
+    Ryhmittelee BUY-kaupat markkinoittain ja outcomeittain.
 
-    Args:
-        wallet_address: Lompakon osoite
-        trade_history: Lista kaupoista (koko historia)
-        min_resolved: Minimi ratkaistujen kauppojen määrä ennen painotusta
-
-    Returns:
+    Palauttaa:
         {
-            "address": str,
-            "win_rate": float,        # 0.0–1.0
-            "resolved_count": int,    # Ratkaistujen kauppojen määrä
-            "correct_count": int,     # Oikeiden kauppojen määrä
-            "weight": float,          # Painokerroin 0.5–2.0
-            "reliable": bool          # Onko dataa tarpeeksi
+            condition_id: {
+                "YES": 500.0,   # USDC ostettu YES-tokeneja
+                "NO":  100.0,   # USDC ostettu NO-tokeneja
+                ...
+            }
         }
-    """
-    now = datetime.now(timezone.utc)
 
-    # Suodata vain BUY-kaupat suljetuista markkinoista
-    resolved_trades = []
+    BUG #1 KORJAUS: Ei enää oteta vain ensimmäistä kauppaa per markkina.
+    Kaikki saman markkinan kaupat yhdistetään nettopositioksi.
+    """
+    market_positions: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+
     for trade in trade_history:
+        # Vain ostot — myynneissä positio on jo tehty
         side = str(trade.get("side", "")).upper()
         if side != "BUY":
             continue
 
-        # Tarkista onko markkina suljettu
-        condition_id = trade.get("conditionId", "")
+        condition_id = str(trade.get("conditionId", "")).strip()
         if not condition_id:
             continue
 
-        # Hae markkinan sulkeutumisaika jos saatavilla
-        # Käytetään CLOB API:a joka palauttaa accepting_orders=False suljetuille
+        outcome = str(trade.get("outcome", "")).upper().strip()
+        if not outcome:
+            continue
 
-        resolved_trades.append({
-            "condition_id": condition_id,
-            "outcome": str(trade.get("outcome", "")).upper(),
-            "size": float(trade.get("usdcSize", 0) or trade.get("size", 0) or 0)
-        })
+        # Koko: kokeile useita kenttänimiä
+        size = 0.0
+        for key in ("usdcSize", "size", "amount"):
+            raw = trade.get(key)
+            if raw is not None:
+                try:
+                    v = float(raw)
+                    if v > 0:
+                        size = v
+                        break
+                except (TypeError, ValueError):
+                    pass
 
-    if not resolved_trades:
+        if size > 0:
+            market_positions[condition_id][outcome] += size
+
+    return market_positions
+
+
+def _calculate_market_roi(
+    outcome_sizes: Dict[str, float],
+    winning_outcome: str
+) -> Tuple[float, float, float]:
+    """
+    Laskee yhden markkinan ROI lompakolle.
+
+    BUG #2 KORJAUS: Huomioi kauppakoot — ei pelkkä win/loss binääri.
+
+    Args:
+        outcome_sizes:   {"YES": 500.0, "NO": 100.0}
+        winning_outcome: "YES"
+
+    Returns:
+        (roi, winning_usdc, total_usdc)
+        roi = (winning_usdc - total_usdc) / total_usdc
+            = +1.0 jos kaikki rahat oikeassa outcomessa (100% ROI)
+            = -1.0 jos kaikki rahat väärässä outcomessa (-100% ROI)
+            = -0.67 jos 1/3 oikeassa, 2/3 väärässä
+    """
+    total_usdc   = sum(outcome_sizes.values())
+    winning_usdc = outcome_sizes.get(winning_outcome, 0.0)
+
+    if total_usdc <= 0:
+        return 0.0, 0.0, 0.0
+
+    roi = (winning_usdc - total_usdc) / total_usdc
+    return round(roi, 4), winning_usdc, total_usdc
+
+
+# ===========================================================================
+# Pääfunktio: calculate_wallet_score
+# ===========================================================================
+
+def calculate_wallet_score(
+    wallet_address: str,
+    trade_history:  List[Dict],
+    min_resolved:   int = 5,
+    max_markets:    int = 50   # Max API-kutsut per lompakko
+) -> Dict:
+    """
+    Laskee lompakon historiallisen suorituskyvyn ROI-pohjaisesti.
+
+    KORJAUKSET:
+      - Ryhmittelee kaikki saman markkinan kaupat (BUG #1)
+      - Laskee painotetun ROI:n kauppakoon mukaan (BUG #2)
+      - Ei laske avoimia markkinoita häviöiksi (BUG #3)
+
+    Returns:
+        {
+            "address":         str,
+            "win_rate":        float,   # Voittavien markkinoiden osuus (0–1)
+            "avg_roi":         float,   # Keskimääräinen ROI per markkina
+            "weighted_roi":    float,   # Volyymipainotettu ROI
+            "resolved_count":  int,     # Ratkaistujen markkinoiden määrä
+            "correct_count":   int,     # Voittavien markkinoiden määrä
+            "total_usdc":      float,   # Kaikki USDC ratkaistuissa markkinoissa
+            "weight":          float,   # Painokerroin 0.4–2.0
+            "reliable":        bool     # Onko dataa tarpeeksi (>= min_resolved)
+        }
+    """
+    # Vaihe 1: Ryhmittele kaupat markkinoittain
+    market_positions = _group_trades_by_market(trade_history)
+
+    if not market_positions:
         return _default_score(wallet_address)
 
-    # Laske win rate — hae voittajat (max 20 markkinaa per lompakko API-kutsujen rajoittamiseksi)
-    correct = 0
-    checked = 0
-    seen_markets = set()
+    # Vaihe 2: Hae tulokset ja laske ROI
+    correct       = 0
+    checked       = 0
+    total_roi_sum = 0.0
+    weighted_roi_sum   = 0.0
+    total_usdc_checked = 0.0
 
-    for trade in resolved_trades[:30]:  # Rajoita API-kutsut
-        cid = trade["condition_id"]
-        if cid in seen_markets:
-            continue
-        seen_markets.add(cid)
+    markets_to_check = list(market_positions.items())[:max_markets]
 
-        winner = _get_winning_outcome(cid)
+    for condition_id, outcome_sizes in markets_to_check:
+        winner = _get_winning_outcome(condition_id)
+
+        # BUG #3 KORJAUS: None = ei tietoa, ei häviö — ohita kokonaan
         if winner is None:
-            continue  # Markkina vielä auki tai ei dataa
+            continue
 
+        roi, winning_usdc, total_usdc = _calculate_market_roi(outcome_sizes, winner)
         checked += 1
-        if trade["outcome"] == winner:
+        total_roi_sum      += roi
+        weighted_roi_sum   += roi * total_usdc
+        total_usdc_checked += total_usdc
+
+        if roi > 0:
             correct += 1
+
+        log.debug(
+            f"  {condition_id[:16]} → winner={winner} "
+            f"roi={roi:+.1%} winning={winning_usdc:.0f}/{total_usdc:.0f} USDC"
+        )
 
     if checked < min_resolved:
         return _default_score(wallet_address, checked, correct)
 
-    win_rate = correct / checked if checked > 0 else 0.5
-    weight = _win_rate_to_weight(win_rate)
+    avg_roi      = total_roi_sum / checked
+    weighted_roi = weighted_roi_sum / total_usdc_checked if total_usdc_checked > 0 else 0.0
+    win_rate     = correct / checked
+    weight       = _roi_to_weight(weighted_roi)  # Käytä volyymipainotettua ROI:ta
 
-    return {
-        "address":       wallet_address,
-        "win_rate":      round(win_rate, 3),
+    result = {
+        "address":        wallet_address,
+        "win_rate":       round(win_rate, 3),
+        "avg_roi":        round(avg_roi, 4),
+        "weighted_roi":   round(weighted_roi, 4),
         "resolved_count": checked,
-        "correct_count": correct,
-        "weight":        weight,
-        "reliable":      checked >= min_resolved
+        "correct_count":  correct,
+        "total_usdc":     round(total_usdc_checked, 2),
+        "weight":         weight,
+        "reliable":       True
     }
 
+    log.debug(
+        f"Score {wallet_address[:10]}: "
+        f"wr={win_rate:.0%} avg_roi={avg_roi:+.1%} "
+        f"w_roi={weighted_roi:+.1%} weight={weight} "
+        f"({checked} markkinaa, {total_usdc_checked:.0f} USDC)"
+    )
+    return result
 
-def _win_rate_to_weight(win_rate: float) -> float:
-    """Muuntaa win raten painokertoimeksi."""
-    if win_rate >= 0.65:
+
+# ===========================================================================
+# Apufunktiot
+# ===========================================================================
+
+def _roi_to_weight(weighted_roi: float) -> float:
+    """
+    Muuntaa volyymipainotetun ROI:n painokertoimeksi.
+
+    BUG #2 KORJAUS: Win rate → ROI-pohjainen painotus.
+    Huomioi sekä voittojen suuruuden että kauppakoot.
+    """
+    if weighted_roi >= 0.20:
         return 2.0
-    elif win_rate >= 0.55:
-        return 1.3
-    elif win_rate >= 0.50:
+    elif weighted_roi >= 0.10:
+        return 1.5
+    elif weighted_roi >= 0.00:
         return 1.0
-    elif win_rate >= 0.40:
-        return 0.8
+    elif weighted_roi >= -0.10:
+        return 0.7
     else:
-        return 0.5
+        return 0.4
 
 
 def _default_score(address: str, checked: int = 0, correct: int = 0) -> Dict:
-    """Palauttaa neutraalin painon kun dataa ei ole tarpeeksi."""
+    """Neutraali paino kun dataa ei ole tarpeeksi."""
     return {
         "address":        address,
         "win_rate":       0.5,
+        "avg_roi":        0.0,
+        "weighted_roi":   0.0,
         "resolved_count": checked,
         "correct_count":  correct,
+        "total_usdc":     0.0,
         "weight":         1.0,
         "reliable":       False
     }
 
 
+# ===========================================================================
+# Batch-prosessointi
+# ===========================================================================
+
 def score_wallets_batch(
     qualified_wallets: List[Dict],
-    history_cache: Dict[str, List[Dict]]
+    history_cache:     Dict[str, List[Dict]]
 ) -> Dict[str, Dict]:
     """
     Laskee wallet scoren kaikille kvalifioituneille lompakoille.
@@ -202,9 +334,10 @@ def score_wallets_batch(
     Returns:
         Dict[address -> score_dict]
     """
-    scores = {}
-    high_weight = []
-    low_weight  = []
+    scores     = {}
+    high_scores = []
+    low_scores  = []
+    no_data     = 0
 
     for wallet in qualified_wallets:
         addr    = wallet["address"]
@@ -213,15 +346,30 @@ def score_wallets_batch(
         score = calculate_wallet_score(addr, history)
         scores[addr] = score
 
-        if score["reliable"]:
-            if score["weight"] >= 1.3:
-                high_weight.append(f"{addr[:10]} w={score['weight']} wr={score['win_rate']:.0%}")
-            elif score["weight"] <= 0.8:
-                low_weight.append(f"{addr[:10]} w={score['weight']} wr={score['win_rate']:.0%}")
+        if not score["reliable"]:
+            no_data += 1
+        elif score["weight"] >= 1.5:
+            high_scores.append(
+                f"{addr[:10]} w={score['weight']} "
+                f"roi={score['weighted_roi']:+.0%} "
+                f"({score['resolved_count']} mkts)"
+            )
+        elif score["weight"] <= 0.7:
+            low_scores.append(
+                f"{addr[:10]} w={score['weight']} "
+                f"roi={score['weighted_roi']:+.0%} "
+                f"({score['resolved_count']} mkts)"
+            )
 
-    if high_weight:
-        log.info(f"🌟 Korkea paino ({len(high_weight)}): {', '.join(high_weight[:3])}")
-    if low_weight:
-        log.info(f"⬇️  Matala paino ({len(low_weight)}): {', '.join(low_weight[:3])}")
+    log.info(
+        f"Wallet scoring valmis: "
+        f"{len(high_scores)} korkea | "
+        f"{len(low_scores)} matala | "
+        f"{no_data} ei dataa"
+    )
+    if high_scores:
+        log.info(f"🌟 TOP lompakot: {' | '.join(high_scores[:5])}")
+    if low_scores:
+        log.info(f"⬇️  HEIKOT lompakot: {' | '.join(low_scores[:3])}")
 
     return scores

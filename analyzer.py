@@ -1,21 +1,25 @@
 """
 =============================================================================
-analyzer.py – WalletAnalyzer  (v4.0 – Konsensuspohjainen, ei win ratea)
+analyzer.py – WalletAnalyzer  (v5.0 – Integroitu wallet scoring)
 =============================================================================
-Strategia: Win rate -laskenta on mahdoton ilman settlement-dataa.
-Korvataan se konsensuspohjaisella analyysillä:
+KORJAUKSET v4.0 → v5.0:
 
-KRITEERIT lompakkojen valintaan:
+  BUG #4  analyze() ei käyttänyt wallet_scorer.py:n painoja mitenkään
+          → Scorer laskettiin mutta tuloksia ei koskaan sovellettu
+          → Nyt analyze() ottaa wallet_scores-parametrin ja:
+              a) Lisää score-tiedot jokaiseen qualified-walletiin
+              b) Järjestää lompakot painotetulla volyymilla (volume × weight)
+                 eikä pelkällä volyymilla
+              c) Suodattaa pois lompakot joiden paino on alle min_weight
+
+  LISÄYS  Loki kertoo nyt selvästi miten scoring vaikutti järjestykseen
+          → Helpompi debugata miksi tietty lompakko valittiin/hylättiin
+
+STRATEGIA (ennallaan):
   1. Aktiivisuus: ≥3 kauppaa viimeisen 48h aikana
-  2. Kauppakoko: keskiarvo 200-5000 USDC (ei pieniä botteja)
-  3. Sitoutuminen: ostaa pian sulkeutuvaa markkinaa (≤7pv)
-
-SMART FOLLOW -signaali:
-  - ≥3 kvalifioitua lompakon ostaa samaa outcomea samalla markkinalla
-  - Yhdistetty positiokoko ≥10 000 USDC
-  - Markkina sulkeutuu ≤7 päivän sisällä
-
-Tämä mittaa markkinakonsensusta — parempi signaali kuin yksittäinen win rate.
+  2. Kauppakoko: keskiarvo 200–5000 USDC
+  3. Scorer-paino: ≥ min_weight (oletus 0.7 — suodattaa selvästi huonot)
+  4. Järjestys: total_volume_usdc × wallet_weight (isoimmat + parhaat ensin)
 =============================================================================
 """
 
@@ -31,47 +35,105 @@ class WalletAnalyzer:
 
     def __init__(
         self,
-        min_win_rate:   float = 0.60,   # Ei käytetä — pidetään yhteensopivuuden vuoksi
+        min_win_rate:   float = 0.60,   # Ei käytetä — yhteensopivuuden vuoksi
         min_trades_48h: int   = 3,
         min_avg_size:   float = 200.0,
-        max_avg_size:   float = 5000.0
+        max_avg_size:   float = 5000.0,
+        min_weight:     float = 0.7     # UUSI: suodattaa selvästi huonot lompakot
     ):
         self.min_trades_48h = min_trades_48h
         self.min_avg_size   = min_avg_size
         self.max_avg_size   = max_avg_size
+        self.min_weight     = min_weight
 
     def analyze(
         self,
-        raw_trades: List[Dict[str, Any]],
-        history_cache: Dict = None
+        raw_trades:    List[Dict[str, Any]],
+        history_cache: Dict = None,
+        wallet_scores: Dict = None   # BUG #4 KORJAUS: otetaan scorer-tulokset vastaan
     ) -> List[Dict[str, Any]]:
         """
-        Ryhmittelee kaupat lompakoittain ja suodattaa aktiivisuuden
-        ja kauppakoon perusteella. Win ratea ei lasketa.
+        Ryhmittelee kaupat lompakoittain, suodattaa aktiivisuuden,
+        kauppakoon JA wallet scorer -painon perusteella.
+
+        Args:
+            raw_trades:    Viimeisimmät kaupat fetcheriltä
+            history_cache: Koko historia per lompakko (fetcheriltä)
+            wallet_scores: Scorer-tulokset per lompakko (wallet_scorer.py:ltä)
+                           Jos None, kaikki lompakot saavat neutraalin painon 1.0
         """
         history_cache = history_cache or {}
+        wallet_scores = wallet_scores or {}
 
+        # Ryhmittele kaupat lompakoittain
         wallet_trades: Dict[str, List[Dict]] = defaultdict(list)
         for trade in raw_trades:
             addr = self._extract_address(trade)
             if addr:
                 wallet_trades[addr].append(trade)
 
-        log.info(f"Uniikit lompakot: {len(wallet_trades)}")
+        log.info(f"Uniikit lompakot raakakauppaistossa: {len(wallet_trades)}")
 
         cutoff_48h = datetime.now(timezone.utc) - timedelta(hours=48)
         qualified  = []
+        filtered_low_weight = 0
 
         for address, recent_trades in wallet_trades.items():
             metrics = self._calculate_metrics(address, recent_trades, cutoff_48h)
-            if metrics and self._passes_filter(metrics):
-                qualified.append(metrics)
+            if not metrics:
+                continue
 
-        # Järjestä kauppakoon mukaan — suurimmat positiot ensin
-        qualified.sort(key=lambda x: x["total_volume_usdc"], reverse=True)
-        log.info(f"Kvalifioituja lompakoita: {len(qualified)}")
+            # BUG #4 KORJAUS: Liitä scorer-tiedot metriikoihin
+            score = wallet_scores.get(address) or wallet_scores.get(address.lower()) or {}
+            metrics["wallet_weight"]   = score.get("weight",       1.0)
+            metrics["wallet_roi"]      = score.get("weighted_roi", 0.0)
+            metrics["wallet_win_rate"] = score.get("win_rate",     0.5)
+            metrics["wallet_reliable"] = score.get("reliable",     False)
+            metrics["resolved_count"]  = score.get("resolved_count", 0)
+
+            # Perussuodatus (aktiivisuus + koko)
+            if not self._passes_base_filter(metrics):
+                continue
+
+            # BUG #4 KORJAUS: Hylkää selvästi huonot lompakot scorer-painon mukaan
+            # HUOM: Epäluotettavat lompakot (ei tarpeeksi dataa) läpäisevät tämän
+            #       neutraalilla painolla 1.0 — ei rangaista tietämättömyydestä
+            if metrics["wallet_reliable"] and metrics["wallet_weight"] < self.min_weight:
+                filtered_low_weight += 1
+                log.debug(
+                    f"Hylätty matalan painon takia: {address[:10]} "
+                    f"w={metrics['wallet_weight']} roi={metrics['wallet_roi']:+.1%}"
+                )
+                continue
+
+            qualified.append(metrics)
+
+        # BUG #4 KORJAUS: Järjestä painotetulla volyymilla
+        # → Lompakko jolla suuri volyymi JA hyvä track record nousee ylös
+        qualified.sort(
+            key=lambda x: x["total_volume_usdc"] * x["wallet_weight"],
+            reverse=True
+        )
+
+        log.info(
+            f"Kvalifioituja lompakoita: {len(qualified)} "
+            f"(hylätty matalan painon takia: {filtered_low_weight})"
+        )
+
+        # Loki top-5:stä selkeyden vuoksi
+        for w in qualified[:5]:
+            reliable_str = f"roi={w['wallet_roi']:+.1%}" if w["wallet_reliable"] else "ei dataa"
+            log.info(
+                f"  ✅ {w['address'][:10]}... | "
+                f"48h={w['trades_48h']} kauppaa | "
+                f"avg={w['avg_size_usdc']:.0f} USDC | "
+                f"weight={w['wallet_weight']} | {reliable_str}"
+            )
+
         return qualified
 
+    # ------------------------------------------------------------------
+    # Metriikat
     # ------------------------------------------------------------------
 
     def _calculate_metrics(
@@ -80,6 +142,7 @@ class WalletAnalyzer:
         trades:     List[Dict],
         cutoff_48h: datetime
     ) -> Optional[Dict[str, Any]]:
+        """Laskee perustilastot lompakosta viimeisen 48h kauppojen perusteella."""
 
         recent = [
             t for t in trades
@@ -97,21 +160,31 @@ class WalletAnalyzer:
 
         return {
             "address":           address,
-            "win_rate":          0.0,     # Ei lasketa — pidetään kentän yhteensopivuuden vuoksi
+            "win_rate":          0.0,       # Legacy-kenttä — käytä wallet_win_rate
             "trades_48h":        trades_48h,
             "avg_size_usdc":     avg_size,
             "total_volume_usdc": total_volume,
-            "resolved_count":    0,
             "recent_trades":     recent,
-            "all_trades":        trades
+            "all_trades":        trades,
+            # Scorer-kentät täytetään analyze():ssa
+            "wallet_weight":     1.0,
+            "wallet_roi":        0.0,
+            "wallet_win_rate":   0.5,
+            "wallet_reliable":   False,
+            "resolved_count":    0,
         }
 
-    def _passes_filter(self, m: Dict) -> bool:
+    def _passes_base_filter(self, m: Dict) -> bool:
+        """Perussuodatus: aktiivisuus ja kauppakoko."""
         return (
             m["trades_48h"]    >= self.min_trades_48h and
             m["avg_size_usdc"] >= self.min_avg_size   and
             m["avg_size_usdc"] <= self.max_avg_size
         )
+
+    # ------------------------------------------------------------------
+    # Parsinta
+    # ------------------------------------------------------------------
 
     def _extract_address(self, trade: Dict) -> Optional[str]:
         for key in ("proxyWallet", "proxy_wallet", "_wallet_address", "maker"):

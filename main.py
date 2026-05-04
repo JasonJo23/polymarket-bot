@@ -1,11 +1,15 @@
 """
 =============================================================================
-main.py – Scout  (v3.0 – 10 bugia korjattu)
+main.py – Scout  (v4.0 – Scorer integroitu analyzeriin)
 =============================================================================
-Korjaukset:
-  #1  daily_spent lukee todellisen ostokoon signaalista
-  #5  SMART_FOLLOW_THRESHOLD luetaan vain kerran
-  #6  Logi kirjoitetaan vain tiedostoon — ei stdout-duplikaattia nohup-ajossa
+KORJAUKSET v3.0 → v4.0:
+
+  BUG #4  wallet_scorer.py:n tulokset eivät kulkeutuneet analyzer.py:lle
+          → score_wallets_batch() kutsuttiin mutta paluuarvo hylättiin
+          → Nyt: scores = score_wallets_batch(...) → analyzer.analyze(..., wallet_scores=scores)
+
+  LISÄYS  Scorer-statistiikka lokiin ennen signaaliajoa
+          → Näet kuinka moni lompakko on luotettava / korkean painon
 =============================================================================
 """
 
@@ -18,13 +22,12 @@ from dotenv import load_dotenv
 from fetcher import GammaFetcher
 from analyzer import WalletAnalyzer
 from tracker import SignalTracker
+from wallet_scorer import score_wallets_batch
 
 load_dotenv()
 
-# FIX #8: Nohup-ajossa ei tarvita StreamHandler — vain tiedosto
-# Jos ajetaan interaktiivisesti, lisätään myös konsoli
 _handlers = [logging.FileHandler("scout.log", encoding="utf-8")]
-if os.isatty(1):  # Vain jos terminaali auki
+if os.isatty(1):
     _handlers.append(logging.StreamHandler())
 
 logging.basicConfig(
@@ -46,27 +49,28 @@ def get_bankroll_usdc() -> float:
 
 def main():
     log.info("=" * 60)
-    log.info("Polymarket CopyTrader Scout käynnistyy...")
+    log.info("Polymarket CopyTrader Scout käynnistyy (v4.0)...")
     log.info("=" * 60)
 
-    poll_interval   = int(os.getenv("POLL_INTERVAL_SECONDS", 1800))
-    dry_run         = os.getenv("DRY_RUN", "true").lower() == "true"
-    min_win_rate    = float(os.getenv("MIN_WIN_RATE", 0.60))
-    min_trades_48h  = int(os.getenv("MIN_TRADES_48H", 3))
-    min_avg_size    = float(os.getenv("MIN_AVG_SIZE_USDC", 200))
-    max_avg_size    = float(os.getenv("MAX_AVG_SIZE_USDC", 5000))
-
-    # FIX #6: SMART_FOLLOW_THRESHOLD luetaan vain kerran
-    smart_threshold    = int(os.getenv("SMART_FOLLOW_THRESHOLD", 5))
-    min_signal_size    = float(os.getenv("MIN_SIGNAL_SIZE_USDC", 50000))
+    poll_interval        = int(os.getenv("POLL_INTERVAL_SECONDS", 1800))
+    dry_run              = os.getenv("DRY_RUN", "true").lower() == "true"
+    min_win_rate         = float(os.getenv("MIN_WIN_RATE", 0.60))
+    min_trades_48h       = int(os.getenv("MIN_TRADES_48H", 3))
+    min_avg_size         = float(os.getenv("MIN_AVG_SIZE_USDC", 200))
+    max_avg_size         = float(os.getenv("MAX_AVG_SIZE_USDC", 5000))
+    min_weight           = float(os.getenv("MIN_WALLET_WEIGHT", 0.7))
+    smart_threshold      = int(os.getenv("SMART_FOLLOW_THRESHOLD", 5))
+    min_signal_size      = float(os.getenv("MIN_SIGNAL_SIZE_USDC", 50000))
     max_orders_per_cycle = int(os.getenv("MAX_ORDERS_PER_CYCLE", 3))
-    min_bankroll       = float(os.getenv("MIN_BANKROLL_USDC", 80))
-    max_daily_loss     = float(os.getenv("MAX_DAILY_LOSS_USDC", 30))
+    min_bankroll         = float(os.getenv("MIN_BANKROLL_USDC", 80))
+    max_daily_loss       = float(os.getenv("MAX_DAILY_LOSS_USDC", 30))
     position_check_interval = int(os.getenv("POSITION_CHECK_SECONDS", 300))
 
-    log.info(f"Asetukset: DRY_RUN={dry_run} | Poll={poll_interval}s | "
-             f"Threshold={smart_threshold} | Trades48h>={min_trades_48h}")
-    log.info(f"Signaalisuodatus: ≥{smart_threshold} lompakon | ≥{min_signal_size:.0f} USDC")
+    log.info(
+        f"Asetukset: DRY_RUN={dry_run} | Poll={poll_interval}s | "
+        f"Threshold={smart_threshold} | Trades48h>={min_trades_48h} | "
+        f"MinWeight={min_weight}"
+    )
 
     if dry_run:
         log.warning("⚠️  DRY RUN -tila PÄÄLLÄ – oikeita ostoja EI tehdä.")
@@ -78,7 +82,8 @@ def main():
         min_win_rate=min_win_rate,
         min_trades_48h=min_trades_48h,
         min_avg_size=min_avg_size,
-        max_avg_size=max_avg_size
+        max_avg_size=max_avg_size,
+        min_weight=min_weight
     )
     tracker = SignalTracker(smart_threshold=smart_threshold, dry_run=dry_run)
 
@@ -143,16 +148,36 @@ def main():
             if not raw_trades:
                 log.warning("Ei dataa – odotetaan.")
             else:
-                # 2. Analyysi
                 history_cache = fetcher.get_wallet_history_cache() \
                     if hasattr(fetcher, "get_wallet_history_cache") else {}
-                qualified_wallets = analyzer.analyze(raw_trades, history_cache=history_cache)
-                log.info(f"Kvalifioituja lompakoita: {len(qualified_wallets)}")
 
-                for w in qualified_wallets[:10]:
-                    log.info(f"  ✅ {w['address'][:10]}... | Trades48h={w['trades_48h']} | AvgSize={w['avg_size_usdc']:.0f} USDC")
+                # 2. Wallet scoring — ENSIN ennen analyzeria
+                # BUG #4 KORJAUS: scores tallennetaan ja välitetään analyzerille
+                log.info("Lasketaan wallet scoret...")
+                # Tarvitaan väliaikaisesti kaikki lompakot historiasta
+                all_wallets_temp = [
+                    {"address": addr}
+                    for addr in history_cache.keys()
+                ]
+                scores = score_wallets_batch(all_wallets_temp, history_cache)
 
-                # 3. Signaalit
+                reliable_count = sum(1 for s in scores.values() if s["reliable"])
+                high_weight_count = sum(1 for s in scores.values() if s["weight"] >= 1.5)
+                log.info(
+                    f"Wallet scoring: {len(scores)} lompakkoa | "
+                    f"{reliable_count} luotettavaa | "
+                    f"{high_weight_count} korkean painon"
+                )
+
+                # 3. Analyysi — BUG #4 KORJAUS: välitetään wallet_scores
+                qualified_wallets = analyzer.analyze(
+                    raw_trades,
+                    history_cache=history_cache,
+                    wallet_scores=scores          # ← TÄMÄ PUUTTUI ENNEN
+                )
+                log.info(f"Kvalifioituja lompakoita scoring-suodatuksen jälkeen: {len(qualified_wallets)}")
+
+                # 4. Signaalit
                 signals = tracker.process(qualified_wallets, raw_trades)
 
                 if signals:
@@ -182,9 +207,10 @@ def main():
                         success = tracker.execute_order(sig)
 
                         if success and not dry_run:
-                            # FIX #1: Käytä todellista ostokokoa signaalista
-                            actual_size = sig.get("_actual_order_size", 
-                                          float(os.getenv("MAX_ORDER_SIZE_USDC", 5)))
+                            actual_size = sig.get(
+                                "_actual_order_size",
+                                float(os.getenv("MAX_ORDER_SIZE_USDC", 5))
+                            )
                             daily_spent_usdc += actual_size
                             orders_this_cycle += 1
                             save_spending()
@@ -203,7 +229,7 @@ def main():
         except Exception as e:
             log.error(f"Virhe pääsilmukassa: {e}", exc_info=True)
 
-        # Position check joka 5 min odotuksen aikana
+        # Position check odotuksen aikana
         elapsed_wait = 0
         while elapsed_wait < poll_interval:
             sleep_chunk = min(position_check_interval, poll_interval - elapsed_wait)
