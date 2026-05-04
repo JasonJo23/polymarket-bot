@@ -89,12 +89,20 @@ class PolymarketFetcher:
             return []
 
         # Vaihe 3: Historia rinnakkain
+        # Kaksi eri limittia:
+        #   scoring_limit  = SCORING_HISTORY_LIMIT (oletus 300) — pitää sisältää
+        #                    suljettuja markkinoita joista ROI lasketaan
+        #   recent_limit   = HISTORY_LIMIT_PER_WALLET (oletus 100) — 48h kaupat
+        # Haetaan scoring_limit mutta tallennetaan koko historia cacheen,
+        # recent-suodatus tehdään kuten ennenkin cutoff:lla.
+        scoring_limit = int(os.getenv("SCORING_HISTORY_LIMIT", 300))
+        fetch_limit   = max(self.history_limit, scoring_limit)
+
         cutoff      = datetime.now(timezone.utc) - timedelta(hours=hours_back)
         all_recent: List[Dict] = []
 
         def fetch_one(wallet: str):
-            # PERF #1 KORJAUS: käytetään history_limit eikä kovakoodattua 500
-            history = self._fetch_wallet_activity(wallet, limit=self.history_limit)
+            history = self._fetch_wallet_activity(wallet, limit=fetch_limit)
             recent  = [
                 t for t in history
                 if self._ts(t) is not None and self._ts(t) >= cutoff
@@ -106,7 +114,8 @@ class PolymarketFetcher:
         max_workers = int(os.getenv("FETCH_WORKERS", 16))
         log.info(
             f"Haetaan {len(wallets)} lompakon historia "
-            f"({max_workers} rinnakkain, limit={self.history_limit}/lompakko)..."
+            f"({max_workers} rinnakkain, "
+            f"recent={self.history_limit} scoring={scoring_limit}/lompakko)..."
         )
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
