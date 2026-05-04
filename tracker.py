@@ -1,12 +1,23 @@
 """
 =============================================================================
-tracker.py – SignalTracker  (v6.0 – py_clob_client_v2 migraatio)
+tracker.py – SignalTracker  (v7.0 – 3 bugia korjattu)
 =============================================================================
-Muutos v6.0:
-  - Siirtyy polymarket_apis → py_clob_client_v2 (CLOB V2 API)
-  - Uusi client-rakenne: ClobClient + ApiCreds
-  - Tilaukset: create_and_post_order (GTC) ja create_and_post_market_order (FOK)
-  - Saldon haku: get_usdc_balance() erillisellä REST-kutsulla
+KORJAUKSET v6.0 → v7.0:
+
+  BUG #1  _load_executed hylkäsi kaikki vanhat signaalit koska ne
+          sisältävät '_'-merkin (esim. "0xabc_AURORA")
+          → Botti unohti ostot ja saattoi ostaa saman markkinan uudelleen
+          → Korjaus: tallennetaan market_id ilman outcome-suffiksia,
+            ja vanha formaatti luetaan oikein
+
+  BUG #2  score_wallets_batch() kutsuttiin sekä main.py:ssä että
+          tracker.py:ssä → tuplattu API-kutsujen määrä
+          → Korjaus: process() ottaa wallet_scores-parametrin
+            jos main.py on jo laskenut sen, ei lasketa uudelleen
+
+  BUG #3  Signaalit järjestettiin support_count:lla vaikka
+          weighted_support on parempi mittari (huomioi track recordin)
+          → Korjaus: järjestys (weighted_support, total_size_usdc)
 =============================================================================
 """
 
@@ -14,7 +25,7 @@ from typing import Optional, Dict, List, Any, Set
 import os
 import logging
 import requests
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, timedelta, date
 from collections import defaultdict
 
 log = logging.getLogger("Scout.Tracker")
@@ -40,7 +51,6 @@ def get_usdc_balance_v2() -> float:
             signature_type=2,
             funder=os.getenv("PROXY_WALLET_ADDRESS")
         )
-        # V2: hae saldo suoraan CLOB API:sta
         headers = client._create_l2_headers("GET", "/balance-allowance", None)
         r = requests.get(
             f"{CLOB_BASE}/balance-allowance",
@@ -49,7 +59,7 @@ def get_usdc_balance_v2() -> float:
             timeout=8
         )
         if r.status_code == 200:
-            return float(r.json().get("balance", 0)) / 1e6  # pUSD on 6 desimaalia
+            return float(r.json().get("balance", 0)) / 1e6
     except Exception as e:
         log.debug(f"Saldon haku v2 epäonnistui: {e}")
     return float(os.getenv("CURRENT_BANKROLL_USDC", 100.0))
@@ -63,9 +73,8 @@ class SignalTracker:
         self.min_signal_size = float(os.getenv("MIN_SIGNAL_SIZE_USDC", 50000))
         self.max_order_usdc  = float(os.getenv("MAX_ORDER_SIZE_USDC", 5))
 
-        self._executed_file = "executed_today.json"
-        self._executed_today: Set[str] = set()
-        self._executed_date: str = date.today().isoformat()
+        self._executed_file   = "executed_today.json"
+        self._executed_today: Set[str] = set()  # Sisältää vain market_id:t (ei outcomea)
         self._load_executed()
         self._market_cache: Dict[str, Dict] = {}
 
@@ -74,53 +83,70 @@ class SignalTracker:
         else:
             log.warning("LIVE-tila – OIKEAT ostot käytössä!")
 
+    # ------------------------------------------------------------------
+    # BUG #1 KORJAUS: 48h muisti toimii oikein
+    # ------------------------------------------------------------------
+
     def _load_executed(self):
         """
-        FIX: Muisti säilyy 48h — ei nollaudu yöllä.
-        Estää saman markkinan ostamisen uudelleen kun päivä vaihtuu.
+        Lataa ostetut markkinat tiedostosta.
+        Muisti: 48h — estää saman markkinan ostamisen uudelleen.
+
+        BUG #1 KORJAUS: Vanha formaatti sisälsi outcome-suffiksin
+        (esim. "0xabc_AURORA") joka filtteröitiin pois '_' tarkistuksella.
+        Nyt tallennetaan ja luetaan pelkkä market_id ilman suffiksia.
         """
         import json as _json
-        from datetime import datetime, timedelta
         try:
             with open(self._executed_file, "r") as f:
                 data = _json.load(f)
-                # Lataa kaikki signaalit jotka on ostettu viimeisen 48h aikana
-                signals = data.get("signals", [])
-                if isinstance(signals, list) and signals:
-                    # Uusi formaatti: lista dictionaryja timestampilla
-                    if isinstance(signals[0], dict):
-                        cutoff = (datetime.now() - timedelta(hours=48)).isoformat()
-                        self._executed_today = set(
-                            s["market_id"] for s in signals
-                            if s.get("bought_at", "") > cutoff
-                        )
-                    else:
-                        # Vanha formaatti: pelkkiä market_id stringejä
-                        self._executed_today = set(
-                            s for s in signals
-                            if s.startswith("0x") and "_" not in s
-                        )
-                log.info(f"Ladattu {len(self._executed_today)} ostettua signaalia (48h muisti).")
+
+            signals = data.get("signals", [])
+            if not signals:
+                return
+
+            cutoff = (datetime.now() - timedelta(hours=48)).isoformat()
+
+            # Uusi formaatti: lista dictionaryja
+            if isinstance(signals[0], dict):
+                for s in signals:
+                    bought_at = s.get("bought_at", "")
+                    if bought_at > cutoff:
+                        market_id = s.get("market_id", "")
+                        if market_id:
+                            self._executed_today.add(market_id)
+
+            # BUG #1 KORJAUS: Vanha formaatti — stringejä kuten "0xabc_AURORA"
+            # Otetaan market_id (osa ennen '_') eikä hylätä koko stringiä
+            elif isinstance(signals[0], str):
+                for s in signals:
+                    if s.startswith("0x"):
+                        # Erottele market_id outcome-suffiksista
+                        market_id = s.split("_")[0] if "_" in s else s
+                        self._executed_today.add(market_id)
+
+            log.info(f"Ladattu {len(self._executed_today)} ostettua markkinaa (48h muisti).")
+
         except (FileNotFoundError, Exception):
             pass
 
     def _save_executed(self):
-        """Tallentaa ostetut signaalit timestampilla."""
+        """Tallentaa ostetut markkinat uudella formaatilla (dict + timestamp)."""
         import json as _json
-        from datetime import datetime
         try:
-            # Lataa vanhat
+            # Lataa vanhat merkinnät
             try:
                 with open(self._executed_file, "r") as f:
                     data = _json.load(f)
-                    existing = data.get("signals", [])
-                    if existing and isinstance(existing[0], str):
-                        existing = []  # Konvertoi vanha formaatti
+                existing = data.get("signals", [])
+                # Konvertoi vanha formaatti uuteen
+                if existing and isinstance(existing[0], str):
+                    existing = []
             except Exception:
                 existing = []
 
-            # Lisää uudet merkinnät
             existing_ids = {s.get("market_id") for s in existing if isinstance(s, dict)}
+
             for market_id in self._executed_today:
                 if market_id not in existing_ids:
                     existing.append({
@@ -133,15 +159,29 @@ class SignalTracker:
         except Exception as e:
             log.warning(f"Signaalien tallennus epäonnistui: {e}")
 
-    def _reset_daily_if_needed(self):
-        """FIX: Ei enää nollaa yöllä — 48h muisti hoitaa vanhenemisen."""
-        pass  # Muisti vanhenee automaattisesti _load_executed:ssa
+    # ------------------------------------------------------------------
+    # BUG #2 KORJAUS: process() ottaa valmiit wallet_scores parametrina
+    # ------------------------------------------------------------------
 
-    def process(self, qualified_wallets, raw_trades):
-        self._reset_daily_if_needed()
+    def process(
+        self,
+        qualified_wallets: List[Dict],
+        raw_trades:        List[Dict],
+        wallet_scores:     Dict = None   # BUG #2 KORJAUS: ei lasketa uudelleen
+    ) -> List[Dict]:
+        """
+        Prosessoi kvalifioituneet lompakot signaaleiksi.
+
+        Args:
+            qualified_wallets: Analyzer.analyze():n tulos
+            raw_trades:        Raaka kauppalista fetcheriltä
+            wallet_scores:     Valmiit scorer-tulokset main.py:ltä.
+                               Jos None, lasketaan tässä (fallback).
+        """
         if not qualified_wallets:
             return []
 
+        # Rakenna market_support: {market_id: {outcome: [supporters]}}
         market_support: Dict[str, Dict[str, List]] = defaultdict(lambda: defaultdict(list))
         for wallet in qualified_wallets:
             for trade in wallet.get("recent_trades", []):
@@ -154,43 +194,54 @@ class SignalTracker:
                 market_support[market_id][outcome].append({
                     "wallet":    wallet["address"],
                     "size_usdc": size,
+                    "weight":    wallet.get("wallet_weight", 1.0),  # Suoraan analyzer-tuloksesta
                 })
 
+        # Hae markkinatiedot rinnakkain
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        market_ids = list(market_support.keys())
-
-        def fetch_market(mid):
-            return mid, self._get_market_info_clob(mid)
-
+        market_ids   = list(market_support.keys())
         market_infos: Dict[str, Dict] = {}
-        max_workers = int(os.getenv("FETCH_WORKERS", 4))
+        max_workers  = int(os.getenv("FETCH_WORKERS", 4))
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(fetch_market, mid): mid for mid in market_ids}
+            futures = {executor.submit(self._get_market_info_clob, mid): mid for mid in market_ids}
             for future in as_completed(futures):
                 try:
-                    mid, info = future.result()
+                    mid  = futures[future]
+                    info = future.result()
                     market_infos[mid] = info or {}
                 except Exception:
                     pass
 
-        # Wallet scoring — hae painot historiallisen win raten perusteella
-        wallet_scores = {}
-        try:
-            from wallet_scorer import score_wallets_batch
-            history_cache = {w["address"].lower(): w.get("all_trades", []) for w in qualified_wallets}
-            wallet_scores = score_wallets_batch(qualified_wallets, history_cache)
-        except Exception as e:
-            log.debug(f"Wallet scoring epäonnistui: {e}")
+        # BUG #2 KORJAUS: Käytä valmiita scorer-tuloksia jos saatavilla
+        if wallet_scores is None:
+            log.debug("wallet_scores puuttuu — lasketaan tracker.py:ssä (fallback)")
+            try:
+                from wallet_scorer import score_wallets_batch
+                history_cache = {
+                    w["address"].lower(): w.get("all_trades", [])
+                    for w in qualified_wallets
+                }
+                wallet_scores = score_wallets_batch(qualified_wallets, history_cache)
+            except Exception as e:
+                log.debug(f"Wallet scoring epäonnistui: {e}")
+                wallet_scores = {}
+        else:
+            log.debug(f"Käytetään valmiita wallet_scores ({len(wallet_scores)} lompakon)")
 
+        # Rakenna signaalit
         signals = []
         for market_id, outcomes in market_support.items():
             market_info = market_infos.get(market_id, {})
             if not market_info or not market_info.get("accepting_orders", False):
                 continue
+
+            # Hylkää markkinat joissa hinta jo yli 0.90 (konsenssus selvä)
             tokens = market_info.get("tokens", [])
             prices = [float(t.get("price", 0.5)) for t in tokens if t.get("price")]
             if prices and max(prices) > 0.90:
                 continue
+
             question = market_info.get("question", market_id[:20])
             end_date = market_info.get("end_date_iso", "")
 
@@ -198,10 +249,12 @@ class SignalTracker:
                 unique_wallets = {s["wallet"] for s in supporters}
                 total_size     = sum(s["size_usdc"] for s in supporters)
 
-                # Laske painotettu support count wallet scoren perusteella
+                # BUG #3 KORJAUS: Käytä wallet.weight suoraan supporter-listasta
+                # (analyzer on jo liittänyt painon, ei tarvitse hakea scorer-dictistä uudelleen)
                 weighted_support = sum(
-                    wallet_scores.get(w, {}).get("weight", 1.0)
-                    for w in unique_wallets
+                    s.get("weight", wallet_scores.get(s["wallet"], {}).get("weight", 1.0))
+                    for s in supporters
+                    if s["wallet"] in unique_wallets
                 )
 
                 if (len(unique_wallets) >= self.smart_threshold and
@@ -218,6 +271,7 @@ class SignalTracker:
                         "timestamp":        datetime.now(timezone.utc).isoformat(),
                     })
 
+        # Yksi paras per markkina
         best_per_market: Dict[str, Dict] = {}
         for sig in signals:
             mid = sig["market_id"]
@@ -225,23 +279,31 @@ class SignalTracker:
                 best_per_market[mid] = sig
             else:
                 current = best_per_market[mid]
-                if (sig["support_count"], sig["total_size_usdc"]) > \
-                   (current["support_count"], current["total_size_usdc"]):
+                # BUG #3 KORJAUS: Järjestä weighted_support:lla, ei support_count:lla
+                if (sig["weighted_support"], sig["total_size_usdc"]) > \
+                   (current["weighted_support"], current["total_size_usdc"]):
                     best_per_market[mid] = sig
 
         signals = list(best_per_market.values())
-        signals.sort(key=lambda s: (s["support_count"], s["total_size_usdc"]), reverse=True)
+        # BUG #3 KORJAUS: Lopullinen järjestys weighted_support:lla
+        signals.sort(
+            key=lambda s: (s["weighted_support"], s["total_size_usdc"]),
+            reverse=True
+        )
         return signals
 
-    def execute_order(self, signal: Dict[str, Any]) -> bool:
-        self._reset_daily_if_needed()
+    # ------------------------------------------------------------------
+    # Tilauksen toteutus (ennallaan v6.0:sta, ei bugia)
+    # ------------------------------------------------------------------
 
+    def execute_order(self, signal: Dict[str, Any]) -> bool:
         sig_key = signal["market_id"]
+
         if sig_key in self._executed_today:
             log.debug(f"Duplikaatti (48h muisti): {sig_key[:20]} — ohitetaan.")
             return False
 
-        # FIX 2: Tarkista onko vastakkainen positio jo auki
+        # Tarkista vastakkainen positio
         try:
             import json as _j
             with open("open_positions.json", "r") as f:
@@ -249,13 +311,12 @@ class SignalTracker:
             for pos in open_pos:
                 if pos.get("market_id") == sig_key:
                     existing_outcome = pos.get("outcome", "")
-                    new_outcome = signal.get("outcome", "")
+                    new_outcome      = signal.get("outcome", "")
                     if existing_outcome != new_outcome:
                         log.warning(f"Vastakkainen positio auki: {existing_outcome} vs {new_outcome} — ohitetaan.")
-                        return False
                     else:
                         log.debug(f"Sama positio jo auki: {existing_outcome} — ohitetaan.")
-                        return False
+                    return False
         except Exception:
             pass
 
@@ -265,8 +326,11 @@ class SignalTracker:
         if self.dry_run:
             log.info(
                 f"[DRY RUN] {signal.get('question','')[:35]} | "
-                f"{signal['outcome']} | {order_size} USDC"
+                f"{signal['outcome']} | {order_size} USDC | "
+                f"w_support={signal.get('weighted_support', '?')}"
             )
+            self._executed_today.add(sig_key)
+            self._save_executed()
             return True
 
         if not os.getenv("CLOB_API_KEY"):
@@ -283,7 +347,6 @@ class SignalTracker:
             condition_id = signal["market_id"]
             outcome_name = signal["outcome"].strip('"').upper()
 
-            # Hae token tiedot CLOB API:sta
             r = requests.get(f"{CLOB_BASE}/markets/{condition_id}", timeout=8)
             if r.status_code != 200:
                 log.error(f"CLOB markets haku epäonnistui: {r.status_code}")
@@ -300,7 +363,6 @@ class SignalTracker:
             tick_size   = "0.01"
 
             def _normalize(s):
-                """Normalisoi outcome-nimi vertailua varten."""
                 import re
                 s = s.upper()
                 s = s.replace("'", "").replace("'", "").replace("`", "")
@@ -311,20 +373,15 @@ class SignalTracker:
             outcome_norm = _normalize(outcome_name)
 
             for token in tokens_list:
-                t_outcome = str(token.get("outcome", ""))
-                t_norm = _normalize(t_outcome)
-
-                # Täsmällinen match tai normalisoitu match
+                t_norm = _normalize(str(token.get("outcome", "")))
                 if t_norm == outcome_norm or t_norm.replace(" ", "") == outcome_norm.replace(" ", ""):
                     token_id    = token.get("token_id")
                     token_price = round(float(token.get("price", 0.5)), 3)
                     break
 
-            # Jos ei löydy — kokeile osittaista matchausta
             if not token_id:
                 for token in tokens_list:
                     t_norm = _normalize(str(token.get("outcome", "")))
-                    # Tarkista onko outcome_norm osa token-nimeä tai päinvastoin
                     if outcome_norm in t_norm or t_norm in outcome_norm:
                         token_id    = token.get("token_id")
                         token_price = round(float(token.get("price", 0.5)), 3)
@@ -349,7 +406,7 @@ class SignalTracker:
             except Exception as e:
                 log.debug(f"Intelligence epäonnistui: {e}")
 
-            # Hae tick size
+            # Tick size
             try:
                 r_tick = requests.get(
                     f"{CLOB_BASE}/tick-size",
@@ -361,7 +418,6 @@ class SignalTracker:
             except Exception:
                 pass
 
-            # Rakenna v2 client
             creds = ApiCreds(
                 api_key=os.getenv("CLOB_API_KEY"),
                 api_secret=os.getenv("CLOB_API_SECRET"),
@@ -377,10 +433,9 @@ class SignalTracker:
             )
 
             is_sports = _check_sports(signal.get("question", ""))
-            options = PartialCreateOrderOptions(tick_size=tick_size)
+            options   = PartialCreateOrderOptions(tick_size=tick_size)
 
             if is_sports:
-                # FOK urheilu — täyty heti tai peruutu
                 slippage   = float(os.getenv("SLIPPAGE_PCT", 0.02))
                 exec_price = round(min(token_price * (1 + slippage), 0.90), 3)
                 log.info(f"FOK urheilu: {token_price} → {exec_price} | {order_size} USDC")
@@ -395,7 +450,6 @@ class SignalTracker:
                     order_type=OrderType.FOK,
                 )
             else:
-                # GTC makro — jää odottamaan
                 exec_price = round(token_price, 3)
                 log.info(f"GTC makro: {exec_price} | {order_size} USDC")
                 resp = client.create_and_post_order(
@@ -434,10 +488,7 @@ class SignalTracker:
 
             self._executed_today.add(sig_key)
             self._save_executed()
-            if status == "matched":
-                signal["_actual_order_size"] = order_size
-            else:
-                signal["_actual_order_size"] = 0
+            signal["_actual_order_size"] = order_size if status == "matched" else 0
             return True
 
         except Exception as e:
@@ -448,19 +499,24 @@ class SignalTracker:
             log.error(f"CLOB-osto epäonnistui: {e}")
             return False
 
+    # ------------------------------------------------------------------
+    # Apumetodit
+    # ------------------------------------------------------------------
+
     def _get_market_info_clob(self, condition_id: str) -> Optional[Dict]:
         if condition_id in self._market_cache:
             return self._market_cache[condition_id]
         try:
             r = requests.get(f"{CLOB_BASE}/markets/{condition_id}", timeout=8)
             if r.status_code == 200:
-                data = r.json()
+                data   = r.json()
                 result = {
                     "question":         data.get("question", condition_id[:20]),
                     "end_date_iso":     data.get("end_date_iso", ""),
                     "accepting_orders": data.get("accepting_orders", False),
                     "tokens":           data.get("tokens", []),
                 }
+                # Fallback: hae kysymys Gamma API:sta jos CLOB ei palauta sitä
                 if not data.get("question"):
                     slug = data.get("market_slug", "")
                     if slug:

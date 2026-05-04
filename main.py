@@ -177,8 +177,8 @@ def main():
                 )
                 log.info(f"Kvalifioituja lompakoita scoring-suodatuksen jälkeen: {len(qualified_wallets)}")
 
-                # 4. Signaalit
-                signals = tracker.process(qualified_wallets, raw_trades)
+                # 4. Signaalit — välitetään valmiit scores, ei lasketa uudelleen
+                signals = tracker.process(qualified_wallets, raw_trades, wallet_scores=scores)
 
                 if signals:
                     log.info(f"🔥 Smart Follow -signaaleja: {len(signals)}")
