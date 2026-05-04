@@ -33,7 +33,14 @@ DATA_BASE  = "https://data-api.polymarket.com"
 class PolymarketFetcher:
 
     def __init__(self):
+        max_workers = int(os.getenv("FETCH_WORKERS", 16))
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=max_workers,
+            pool_maxsize=max_workers + 4
+        )
         self.session = requests.Session()
+        self.session.mount("https://", adapter)
+        self.session.mount("http://",  adapter)
         self.session.headers.update({
             "Accept":     "application/json",
             "User-Agent": "PolymarketScout/6.0"
