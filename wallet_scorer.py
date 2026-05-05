@@ -1,26 +1,22 @@
 """
 =============================================================================
-wallet_scorer.py – WalletScorer  (v3.0 – 4 kriittistä bugia korjattu)
+wallet_scorer.py – WalletScorer  (v4.0 – pysyvä levy-cache)
 =============================================================================
-KORJAUKSET v2.0 → v3.0:
+KORJAUKSET v3.0 → v4.0:
 
-  BUG #1  KRIITTISIN: accepting_orders-kentän oletusarvo oli True
-          → Kaikki markkinat tulkittiin avoimiksi → checked=0 kaikille
-          → Tulos: "0 korkean painon lompakkoa" joka syklissä
-          → KORJAUS: oletusarvo False + Gamma API fallback
+  PERF #1  Scoring 5-9 min per sykli koska CLOB /markets haetaan aina
+           uudelleen vaikka suljettu tulos ei muutu koskaan
+           → KORJAUS: market_cache.json levylle — haetaan kerran, pysyy
 
-  BUG #2  conditionId-formaatti ei täsmännyt activity-dataan
-          → KORJAUS: kokeillaan conditionId, condition_id, market
-
-  BUG #3  ROI-kynnys liian korkea (20% → realistinen 8%)
-          → KORJAUS: >= 8% → 2.0, >= 3% → 1.5, >= 0% → 1.0
-
-  BUG #4  Market maker -suodatin puuttui
-          → Top-holderit ostavat molempia puolia → näyttävät häviäjiltä
-          → KORJAUS: jos molemmat puolet > 30% → suodata pois
+  BUG #1   accepting_orders oletus True → kaikki tulkittiin avoimiksi (v3:ssa korjattu)
+  BUG #2   conditionId-kenttä eri nimillä → kokeillaan useita (v3:ssa korjattu)
+  BUG #3   ROI-kynnys 20% epärealistinen → laskettu 8%:iin (v3:ssa korjattu)
+  BUG #4   Market maker -suodatin puuttui (v3:ssa korjattu)
 =============================================================================
 """
 
+import os
+import json
 import logging
 import requests
 from typing import Dict, List, Optional, Tuple
@@ -28,23 +24,53 @@ from collections import defaultdict
 
 log = logging.getLogger("Scout.WalletScorer")
 
-CLOB_BASE  = "https://clob.polymarket.com"
-GAMMA_BASE = "https://gamma-api.polymarket.com"
+CLOB_BASE   = "https://clob.polymarket.com"
+GAMMA_BASE  = "https://gamma-api.polymarket.com"
+_CACHE_FILE = "market_cache.json"
 
 _market_result_cache: Dict[str, Optional[str]] = {}
+_cache_loaded = False
+
+
+def _load_cache_from_disk():
+    global _cache_loaded
+    if _cache_loaded:
+        return
+    _cache_loaded = True
+    try:
+        with open(_CACHE_FILE, "r") as f:
+            data = json.load(f)
+        _market_result_cache.update(data)
+        resolved = sum(1 for v in data.values() if v is not None)
+        log.info(f"Market cache ladattu: {len(data)} merkintää ({resolved} ratkaistu)")
+    except FileNotFoundError:
+        log.debug("market_cache.json ei löydy — luodaan uusi")
+    except Exception as e:
+        log.warning(f"Cache lataus epäonnistui: {e}")
+
+
+def _save_cache_to_disk():
+    try:
+        to_save = {k: v for k, v in _market_result_cache.items() if v is not None}
+        with open(_CACHE_FILE, "w") as f:
+            json.dump(to_save, f)
+    except Exception as e:
+        log.debug(f"Cache tallennus epäonnistui: {e}")
 
 
 def _get_winning_outcome(condition_id: str) -> Optional[str]:
+    _load_cache_from_disk()
     if condition_id in _market_result_cache:
         return _market_result_cache[condition_id]
-
     winner = _try_clob(condition_id)
     if winner is not None:
         _market_result_cache[condition_id] = winner
+        _save_cache_to_disk()
         return winner
-
     winner = _try_gamma(condition_id)
-    _market_result_cache[condition_id] = winner
+    if winner is not None:
+        _market_result_cache[condition_id] = winner
+        _save_cache_to_disk()
     return winner
 
 
@@ -54,18 +80,16 @@ def _try_clob(condition_id: str) -> Optional[str]:
         if r.status_code != 200:
             return None
         data = r.json()
-        # BUG #1 KORJAUS: oletus False eikä True
         if data.get("accepting_orders", False):
             return None
         for token in data.get("tokens", []):
             if float(token.get("price", 0)) >= 0.99:
                 winner = str(token.get("outcome", "")).upper().strip()
                 if winner:
-                    log.debug(f"CLOB voittaja: {condition_id[:16]} → {winner}")
                     return winner
         return None
     except Exception as e:
-        log.debug(f"CLOB haku epäonnistui: {e}")
+        log.debug(f"CLOB haku epäonnistui ({condition_id[:16]}): {e}")
         return None
 
 
@@ -78,16 +102,15 @@ def _try_gamma(condition_id: str) -> Optional[str]:
         )
         if r.status_code != 200:
             return None
-        data = r.json()
+        data    = r.json()
         markets = data if isinstance(data, list) else data.get("markets", [])
         if not markets:
             return None
         m = markets[0]
         outcome_prices = m.get("outcomePrices", m.get("outcome_prices", {}))
         if isinstance(outcome_prices, str):
-            import json as _j
             try:
-                outcome_prices = _j.loads(outcome_prices)
+                outcome_prices = json.loads(outcome_prices)
             except Exception:
                 return None
         outcomes = m.get("outcomes", [])
@@ -107,19 +130,17 @@ def _try_gamma(condition_id: str) -> Optional[str]:
                     pass
         return None
     except Exception as e:
-        log.debug(f"Gamma haku epäonnistui: {e}")
+        log.debug(f"Gamma haku epäonnistui ({condition_id[:16]}): {e}")
         return None
 
 
 def _is_market_maker(outcome_sizes: Dict[str, float]) -> bool:
-    """BUG #4: Tunnistaa market makerit jotka ostavat molempia puolia."""
     if len(outcome_sizes) < 2:
         return False
     total = sum(outcome_sizes.values())
     if total <= 0:
         return False
-    min_share = min(outcome_sizes.values()) / total
-    return min_share > 0.30
+    return min(outcome_sizes.values()) / total > 0.30
 
 
 def _group_trades_by_market(trade_history: List[Dict]) -> Dict[str, Dict[str, float]]:
@@ -127,7 +148,6 @@ def _group_trades_by_market(trade_history: List[Dict]) -> Dict[str, Dict[str, fl
     for trade in trade_history:
         if str(trade.get("side", "")).upper() != "BUY":
             continue
-        # BUG #2 KORJAUS: kokeile useita kenttänimiä
         condition_id = (
             trade.get("conditionId") or
             trade.get("condition_id") or
@@ -160,12 +180,10 @@ def _calculate_market_roi(outcome_sizes: Dict[str, float], winning_outcome: str)
     winning_usdc = outcome_sizes.get(winning_outcome, 0.0)
     if total_usdc <= 0:
         return 0.0, 0.0, 0.0
-    roi = (winning_usdc - total_usdc) / total_usdc
-    return round(roi, 4), winning_usdc, total_usdc
+    return round((winning_usdc - total_usdc) / total_usdc, 4), winning_usdc, total_usdc
 
 
 def _roi_to_weight(weighted_roi: float) -> float:
-    """BUG #3 KORJAUS: Realistiset kynnykset (vanha: 20%, uusi: 8%)."""
     if weighted_roi >= 0.08:
         return 2.0
     elif weighted_roi >= 0.03:
@@ -180,16 +198,9 @@ def _roi_to_weight(weighted_roi: float) -> float:
 
 def _default_score(address: str, checked: int = 0, correct: int = 0) -> Dict:
     return {
-        "address":        address,
-        "win_rate":       0.5,
-        "avg_roi":        0.0,
-        "weighted_roi":   0.0,
-        "resolved_count": checked,
-        "correct_count":  correct,
-        "total_usdc":     0.0,
-        "weight":         1.0,
-        "reliable":       False,
-        "mm_skipped":     0
+        "address": address, "win_rate": 0.5, "avg_roi": 0.0,
+        "weighted_roi": 0.0, "resolved_count": checked, "correct_count": correct,
+        "total_usdc": 0.0, "weight": 1.0, "reliable": False, "mm_skipped": 0,
     }
 
 
@@ -199,6 +210,7 @@ def calculate_wallet_score(
     min_resolved:   int = 5,
     max_markets:    int = 50
 ) -> Dict:
+    _load_cache_from_disk()
     market_positions = _group_trades_by_market(trade_history)
     if not market_positions:
         return _default_score(wallet_address)
@@ -207,7 +219,6 @@ def calculate_wallet_score(
     total_roi_sum = weighted_roi_sum = total_usdc_checked = 0.0
 
     for condition_id, outcome_sizes in list(market_positions.items())[:max_markets]:
-        # BUG #4: Suodata market makerit
         if _is_market_maker(outcome_sizes):
             mm_skipped += 1
             continue
@@ -227,20 +238,18 @@ def calculate_wallet_score(
 
     avg_roi      = total_roi_sum / checked
     weighted_roi = weighted_roi_sum / total_usdc_checked if total_usdc_checked > 0 else 0.0
-    win_rate     = correct / checked
-    weight       = _roi_to_weight(weighted_roi)
 
     return {
         "address":        wallet_address,
-        "win_rate":       round(win_rate, 3),
+        "win_rate":       round(correct / checked, 3),
         "avg_roi":        round(avg_roi, 4),
         "weighted_roi":   round(weighted_roi, 4),
         "resolved_count": checked,
         "correct_count":  correct,
         "total_usdc":     round(total_usdc_checked, 2),
-        "weight":         weight,
+        "weight":         _roi_to_weight(weighted_roi),
         "reliable":       True,
-        "mm_skipped":     mm_skipped
+        "mm_skipped":     mm_skipped,
     }
 
 
@@ -248,6 +257,7 @@ def score_wallets_batch(
     qualified_wallets: List[Dict],
     history_cache:     Dict[str, List[Dict]]
 ) -> Dict[str, Dict]:
+    _load_cache_from_disk()
     scores = {}
     high_scores = []
     low_scores  = []
@@ -259,28 +269,16 @@ def score_wallets_batch(
         score   = calculate_wallet_score(addr, history)
         scores[addr] = score
         mm_total += score.get("mm_skipped", 0)
-
         if not score["reliable"]:
             no_data += 1
         elif score["weight"] >= 1.5:
-            high_scores.append(
-                f"{addr[:10]} w={score['weight']} "
-                f"roi={score['weighted_roi']:+.0%} ({score['resolved_count']} mkts)"
-            )
+            high_scores.append(f"{addr[:10]} w={score['weight']} roi={score['weighted_roi']:+.0%} ({score['resolved_count']} mkts)")
         elif score["weight"] <= 0.8:
-            low_scores.append(
-                f"{addr[:10]} w={score['weight']} "
-                f"roi={score['weighted_roi']:+.0%} ({score['resolved_count']} mkts)"
-            )
+            low_scores.append(f"{addr[:10]} w={score['weight']} roi={score['weighted_roi']:+.0%} ({score['resolved_count']} mkts)")
 
-    log.info(
-        f"Wallet scoring valmis: {len(high_scores)} korkea | "
-        f"{len(low_scores)} matala | {no_data} ei dataa | "
-        f"{mm_total} MM-kauppaa suodatettu"
-    )
+    log.info(f"Wallet scoring valmis: {len(high_scores)} korkea | {len(low_scores)} matala | {no_data} ei dataa | {mm_total} MM-kauppaa suodatettu")
     if high_scores:
         log.info(f"🌟 TOP lompakot: {' | '.join(high_scores[:5])}")
     if low_scores:
         log.info(f"⬇️  HEIKOT: {' | '.join(low_scores[:3])}")
-
     return scores
