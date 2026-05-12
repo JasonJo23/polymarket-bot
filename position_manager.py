@@ -18,6 +18,11 @@ from typing import Dict, List, Any, Optional, Tuple
 
 log = logging.getLogger("Scout.PositionManager")
 
+try:
+    from notifier import notifier
+except Exception:
+    notifier = None
+
 CLOB_BASE = "https://clob.polymarket.com"
 
 SPORTS_KEYWORDS = [
@@ -271,6 +276,8 @@ def check_and_exit_positions():
             if success:
                 sold_count += 1
                 log.info(f"💰 Myyty: {question[:35]} | P&L: {pnl_pct:+.1%} | {reason}")
+                if notifier:
+                    notifier.notify_sell(question, pnl_pct, reason)
                 continue
 
         remaining.append(pos)

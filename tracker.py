@@ -33,6 +33,11 @@ import requests
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
+try:
+    from notifier import notifier
+except Exception:
+    notifier = None
+
 log = logging.getLogger("Scout.Tracker")
 
 CLOB_BASE  = "https://clob.polymarket.com"
@@ -446,6 +451,8 @@ class SignalTracker:
                 self._save_executed()
                 self._log_signal(signal, dry_run=False, buy_price=exec_price, order_size=order_size)
                 signal["_actual_order_size"] = order_size
+                if notifier:
+                    notifier.notify_buy(signal, exec_price, order_size, status)
             else:
                 log.info(f"Status: {status} — positiota ei lisätty, muistia ei päivitetä")
                 signal["_actual_order_size"] = 0
