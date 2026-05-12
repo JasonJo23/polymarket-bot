@@ -360,6 +360,18 @@ class SignalTracker:
             except Exception as e:
                 log.debug(f"Intelligence epäonnistui: {e}")
 
+            # Edge detector — oma AI-analyysi vs Polymarket-hinta
+            try:
+                from edge_detector import EdgeDetector
+                edge_det = EdgeDetector()
+                edge_result = edge_det.should_buy(signal, token_price)
+                if not edge_result["approved"]:
+                    log.info(f"⏭️  EdgeDetector ohitti: {edge_result['reason'][:80]}")
+                    return False
+                log.info(f"✅ EdgeDetector hyväksyi: edge={edge_result.get('edge',0):+.2f} conf={edge_result.get('confidence','?')}")
+            except Exception as e:
+                log.debug(f"EdgeDetector epäonnistui — jatketaan ilman: {e}")
+
             try:
                 r_tick = requests.get(f"{CLOB_BASE}/tick-size", params={"token_id": token_id}, timeout=5)
                 if r_tick.status_code == 200:
