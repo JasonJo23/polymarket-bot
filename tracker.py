@@ -434,7 +434,7 @@ class SignalTracker:
             log.info(f"✅ Osto tehty: {resp}")
             status = resp.get("status", "") if isinstance(resp, dict) else getattr(resp, "status", "")
 
-            if status == "matched":
+            if status in ("matched", "delayed"):
                 token_amount = round(order_size / exec_price, 4)
                 try:
                     from position_manager import add_position
@@ -446,7 +446,6 @@ class SignalTracker:
                 except Exception as e:
                     log.debug(f"Position lisäys epäonnistui: {e}")
 
-                # BUG #3 KORJAUS: Tallenna muistiin vain onnistuneesta ostosta
                 self._executed_today.add(sig_key)
                 self._save_executed()
                 self._log_signal(signal, dry_run=False, buy_price=exec_price, order_size=order_size)
