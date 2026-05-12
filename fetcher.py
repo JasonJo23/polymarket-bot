@@ -236,50 +236,18 @@ class PolymarketFetcher:
             if not cid:
                 continue
 
-            # STRATEGIA 1: Volyymi-piikki — tuoreet ostajat
-            data = self._get(f"{DATA_BASE}/activity", {
-                "market":        cid,
-                "type":          "TRADE",
-                "side":          "BUY",
-                "sortBy":        "TIMESTAMP",
-                "sortDirection": "DESC",
-                "limit":         50,
-            })
-
-            if data:
-                trades = data if isinstance(data, list) else data.get("data", [])
-                for trade in trades:
-                    # Tarkista onko kauppa tarpeeksi tuore
-                    ts_raw = trade.get("timestamp")
-                    ts = 0
-                    if ts_raw:
-                        try:
-                            if isinstance(ts_raw, (int, float)):
-                                ts = int(ts_raw / 1000) if ts_raw > 1e10 else int(ts_raw)
-                            elif isinstance(ts_raw, str):
-                                from datetime import datetime as _dt
-                                ts = int(_dt.fromisoformat(
-                                    ts_raw.replace("Z", "+00:00")
-                                ).timestamp())
-                        except Exception:
-                            pass
-
-                    if ts >= cutoff_ts:
-                        addr = trade.get("proxyWallet", "")
-                        if addr and addr.startswith("0x") and len(addr) == 42:
-                            wallets_spike.add(addr.lower())
-
-            # STRATEGIA 2: Top holders fallback
-            data2 = self._get(f"{DATA_BASE}/holders", {
+            # Hae top-holderit — activity per markkina ei toimi Polymarket API:ssa
+            data = self._get(f"{DATA_BASE}/holders", {
                 "market": cid,
                 "limit":  self.top_holders,
             })
-            if isinstance(data2, list):
-                for token_obj in data2:
+            if isinstance(data, list):
+                for token_obj in data:
                     for h in token_obj.get("holders", []):
                         addr = h.get("proxyWallet", "")
                         if addr and addr.startswith("0x") and len(addr) == 42:
                             wallets_holders.add(addr.lower())
+                            wallets_spike.add(addr.lower())
 
             time.sleep(self.request_delay)
 
