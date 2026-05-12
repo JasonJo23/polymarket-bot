@@ -7,6 +7,8 @@ import os
 import logging
 import requests
 from datetime import datetime, timezone
+from dotenv import load_dotenv
+load_dotenv()
 
 log = logging.getLogger("Scout.Notifier")
 
