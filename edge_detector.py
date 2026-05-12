@@ -95,29 +95,22 @@ class EdgeDetector:
         if token_price > self.max_token_price:
             return self._reject(f"Hinta liian korkea ({token_price:.3f} > {self.max_token_price}) — ei edgeä")
 
-        # Hae kontekstidata
-        try:
-            news_fetcher = self._get_news_fetcher()
-            context = news_fetcher.get_context_for_market(question)
-        except Exception as e:
-            log.warning(f"Kontekstin haku epäonnistui: {e}")
-            context = {"data_quality": 0.0, "sport": "unknown"}
-
-        data_quality = context.get("data_quality", 0.0)
-
-        # Jos dataa ei ole tarpeeksi → hyväksy konservatiivisesti
-        # (ei hylätä pelkästään datan puuttumisen takia)
-        if data_quality < self.min_data_quality:
-            log.info(
-                f"Data quality matala ({data_quality:.2f}) — "
-                f"hyväksytään konservatiivisesti: {question[:40]}"
-            )
-            return self._approve(
-                f"Dataa ei tarpeeksi (quality={data_quality:.2f}) — konsensus riittää",
-                edge=0.0,
-                our_probability=token_price,
-                confidence="low"
-            )
+        # Luo minimikonteksti — ulkoiset lähteet blokattu verkossa
+        # Claude analysoi pelkän kysymyksen ja hinnan perusteella
+        from datetime import datetime, timezone as _tz
+        context = {
+            "sport":        self._detect_sport(question),
+            "home_team":    "",
+            "away_team":    "",
+            "injuries":     [],
+            "recent_form":  [],
+            "h2h":          [],
+            "news":         [],
+            "lineup_notes": [],
+            "data_quality": 0.5,  # Neutraali — Claude toimii ilman ulkoista dataa
+            "fetched_at":   datetime.now(_tz.utc).isoformat(),
+        }
+        data_quality = 0.5
 
         # Laske todennäköisyys
         try:
@@ -164,6 +157,18 @@ class EdgeDetector:
     # ===========================================================================
     # Apumetodit
     # ===========================================================================
+
+    def _detect_sport(self, question: str) -> str:
+        q = question.lower()
+        if any(k in q for k in ["lol:", "cs2", "csgo", "valorant", "dota", "esports", "lck", "lec"]):
+            return "esports"
+        if any(k in q for k in ["lakers", "celtics", "knicks", "nba", "thunder", "spurs", "76ers"]):
+            return "nba"
+        if any(k in q for k in ["fc ", "arsenal", "chelsea", "liverpool", "madrid", "barcelona"]):
+            return "football"
+        if any(k in q for k in ["trump", "biden", "iran", "election", "fed", "btc", "eth"]):
+            return "politics/macro"
+        return "general"
 
     def _approve(
         self,

@@ -177,34 +177,29 @@ class ProbabilityEngine:
         context_sections = [s for s in [injury_text, form_text, h2h_text, news_text, lineup_text] if s]
         context_str = "\n\n".join(context_sections) if context_sections else "Ei lisädataa saatavilla."
 
-        prompt = f"""Olet urheiluanalytikko. Tehtäväsi on arvioida todennäköisyys prediction market -vedonlyöntiin.
+        prompt = f"""Olet prediction market -analyytikko. Arvioi todennäköisyys markkinalle.
 
 MARKKINA: {question}
 ARVIOITAVA OUTCOME: {outcome}
-NYKYINEN POLYMARKET-HINTA: {polymarket_price:.3f} (= markkinoiden arvio {polymarket_price*100:.1f}%)
+POLYMARKET-HINTA: {polymarket_price:.3f} ({polymarket_price*100:.1f}%)
 LAJI: {sport}
 
---- SAATAVILLA OLEVA DATA ---
-{context_str}
---- DATA PÄÄTTYY ---
+{context_str if context_str != "Ei lisädataa saatavilla." else "Ei ulkoista dataa saatavilla — käytä yleistietoa."}
 
-TEHTÄVÄ:
-Arvioi todennäköisyys että outcome "{outcome}" toteutuu.
-Huomioi erityisesti:
-1. Loukkaantumiset (avainpelaajien puuttuminen muuttaa todennäköisyyttä merkittävästi)
-2. Viimeaikainen vire (voittoputki tai tappiojono)
-3. Keskinäinen historia
-4. Tuoreet uutiset jotka voivat vaikuttaa tulokseen
+OHJE:
+- Arvioi onko Polymarket-hinta oikein vai väärin
+- Esports: analysoi joukkueiden tasoerot ja turnausmuoto
+- NBA: analysoi joukkueiden vire ja matchup
+- Politiikka/makro: analysoi todennäköisyys taustatiedon perusteella
+- Jos et tiedä tarpeeksi → anna confidence "low" ja our_probability lähelle Polymarket-hintaa
+- Edge syntyy vain kun tiedät jotain mitä hinta ei heijasta
 
-Ole tarkka: jos Polymarket-hinta on jo oikein, sano se suoraan.
-Edge syntyy VAIN jos tiedät jotain mitä hinnoittelu ei vielä heijasta.
-
-Vastaa AINOASTAAN tässä JSON-formaatissa, ei mitään muuta tekstiä:
+Vastaa VAIN JSON, ei muuta tekstiä:
 {{
-  "our_probability": <luku 0.0-1.0>,
+  "our_probability": <0.0-1.0>,
   "confidence": "<high|medium|low>",
-  "reasoning": "<max 150 merkkiä, konkreettinen perustelu>",
-  "key_factors": ["<tekijä 1>", "<tekijä 2>"]
+  "reasoning": "<max 100 merkkiä>",
+  "key_factors": ["<tekijä>"]
 }}"""
 
         return prompt
