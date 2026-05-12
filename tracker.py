@@ -306,7 +306,14 @@ class SignalTracker:
             condition_id = signal["market_id"]
             outcome_name = signal["outcome"].strip('"').upper()
 
+            # Rate limit suoja — CLOB sallii ~1 kutsu/sekunti
+            import time as _time
+            _time.sleep(1.0)
             r = requests.get(f"{CLOB_BASE}/markets/{condition_id}", timeout=8)
+            if r.status_code == 429:
+                log.warning("CLOB rate limit (429) — odotetaan 10s...")
+                _time.sleep(10)
+                r = requests.get(f"{CLOB_BASE}/markets/{condition_id}", timeout=8)
             if r.status_code != 200:
                 log.error(f"CLOB markets haku epäonnistui: {r.status_code}")
                 return False
