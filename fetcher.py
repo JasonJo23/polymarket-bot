@@ -207,28 +207,97 @@ class PolymarketFetcher:
         return data
 
     def _collect_wallets_from_holders(self, markets: List[Dict]) -> List[str]:
-        """Kerää uniikit lompakot /holders-endpointista."""
-        wallets: set = set()
+        """
+        Kerää uniikit lompakot kahdella strategialla:
+
+        STRATEGIA 1 — Volyymi-piikki (päästrategia):
+          Hakee lompakot jotka ovat ostaneet viimeisen VOLUME_SPIKE_HOURS
+          tunnin aikana. Nämä ovat todennäköisemmin informoituja treidaajia
+          jotka reagoivat tuoreeseen tietoon (kokoonpano, uutinen, insider).
+
+        STRATEGIA 2 — Top holders (fallback):
+          Jos volyymi-piikki ei löydä tarpeeksi lompakoita, täydennetään
+          top-holdereilla. Tämä pitää signaalin ehjänä hiljaisinakin hetkinä.
+
+        Miksi volyymi-piikki on parempi:
+          - Top holder on ollut sisällä viikkoja → markkinat tietävät jo
+          - Tuore osto 2h sisällä → reaktio uuteen informaatioon
+          - Edge syntyy nopeudesta, ei positiokoosta
+        """
+        spike_hours  = int(os.getenv("VOLUME_SPIKE_HOURS", 2))
+        min_spike_wallets = int(os.getenv("MIN_SPIKE_WALLETS", 10))
+        cutoff_ts    = int((datetime.now(timezone.utc) - timedelta(hours=spike_hours)).timestamp())
+
+        wallets_spike: set = set()
+        wallets_holders: set = set()
 
         for market in markets:
             cid = market.get("conditionId") or market.get("condition_id")
             if not cid:
                 continue
 
-            data = self._get(f"{DATA_BASE}/holders", {
+            # STRATEGIA 1: Volyymi-piikki — tuoreet ostajat
+            data = self._get(f"{DATA_BASE}/activity", {
+                "market":        cid,
+                "type":          "TRADE",
+                "side":          "BUY",
+                "sortBy":        "TIMESTAMP",
+                "sortDirection": "DESC",
+                "limit":         50,
+            })
+
+            if data:
+                trades = data if isinstance(data, list) else data.get("data", [])
+                for trade in trades:
+                    # Tarkista onko kauppa tarpeeksi tuore
+                    ts_raw = trade.get("timestamp")
+                    ts = 0
+                    if ts_raw:
+                        try:
+                            if isinstance(ts_raw, (int, float)):
+                                ts = int(ts_raw / 1000) if ts_raw > 1e10 else int(ts_raw)
+                            elif isinstance(ts_raw, str):
+                                from datetime import datetime as _dt
+                                ts = int(_dt.fromisoformat(
+                                    ts_raw.replace("Z", "+00:00")
+                                ).timestamp())
+                        except Exception:
+                            pass
+
+                    if ts >= cutoff_ts:
+                        addr = trade.get("proxyWallet", "")
+                        if addr and addr.startswith("0x") and len(addr) == 42:
+                            wallets_spike.add(addr.lower())
+
+            # STRATEGIA 2: Top holders fallback
+            data2 = self._get(f"{DATA_BASE}/holders", {
                 "market": cid,
                 "limit":  self.top_holders,
             })
-
-            if isinstance(data, list):
-                for token_obj in data:
+            if isinstance(data2, list):
+                for token_obj in data2:
                     for h in token_obj.get("holders", []):
                         addr = h.get("proxyWallet", "")
                         if addr and addr.startswith("0x") and len(addr) == 42:
-                            wallets.add(addr.lower())
+                            wallets_holders.add(addr.lower())
+
             time.sleep(self.request_delay)
 
-        return list(wallets)
+        # Yhdistä: volyymi-piikki ensin, täydennä holdereilla jos liian vähän
+        combined = list(wallets_spike)
+        spike_count = len(wallets_spike)
+
+        if spike_count < min_spike_wallets:
+            # Lisää top-holderit jotka eivät ole jo listalla
+            for w in wallets_holders:
+                if w not in wallets_spike:
+                    combined.append(w)
+
+        log.info(
+            f"Lompakkohaku: {spike_count} volyymi-piikki ({spike_hours}h) + "
+            f"{len(combined) - spike_count} top-holder täydennystä = {len(combined)} yhteensä"
+        )
+        return combined
 
     def _fetch_wallet_activity(self, wallet: str, limit: int = 100) -> List[Dict]:
         """Hakee lompakon kauppahistorian."""
