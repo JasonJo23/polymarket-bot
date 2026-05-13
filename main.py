@@ -1,29 +1,19 @@
 """
 =============================================================================
-main.py – Scout  (v5.0 – .env korjattu, kassa-näyttö parannettu)
+main.py – Scout  (v4.0 – Scorer integroitu analyzeriin)
 =============================================================================
-KORJAUKSET v4.0 → v5.0:
+KORJAUKSET v3.0 → v4.0:
 
-  BUG #1  .env:ssä TOP_HOLDERS=25 ja TOP_HOLDERS=10 — kaksoismäärittely
-          → Python-dotenv lukee ensimmäisen, toinen ignoroidaan
-          → Ei koodikorjausta — huomautetaan lokissa
+  BUG #4  wallet_scorer.py:n tulokset eivät kulkeutuneet analyzer.py:lle
+          → score_wallets_batch() kutsuttiin mutta paluuarvo hylättiin
+          → Nyt: scores = score_wallets_batch(...) → analyzer.analyze(..., wallet_scores=scores)
 
-  BUG #2  Kassa näyttää aina 120 USDC — ei vähennä avoimia positioita
-          → Harhaanjohtava — luulee kassaa olevan enemmän kuin on
-          → KORJAUS: näytetään todellinen saldo + avointen positioiden
-            yhteisarvo ostohintaan erikseen
-
-  BUG #3  MIN_WALLET_WEIGHT luetaan .env:stä mutta ei välitetä
-          WalletAnalyzer-konstruktorille
-          → Analyzerissa käytettiin hardkoodattua 0.7:ää
-          → KORJAUS: luetaan .env:stä, välitetään konstruktorille
-
-  UUSI    Scoring-cache ladataan kerran — nopeutuu merkittävästi
+  LISÄYS  Scorer-statistiikka lokiin ennen signaaliajoa
+          → Näet kuinka moni lompakko on luotettava / korkean painon
 =============================================================================
 """
 
 import os
-import json
 import time
 import logging
 from datetime import datetime, timezone
@@ -54,25 +44,12 @@ def get_bankroll_usdc() -> float:
         return get_usdc_balance_v2()
     except Exception as e:
         log.warning(f"Saldon haku epäonnistui: {e}")
-    return float(os.getenv("CURRENT_BANKROLL_USDC", 100.0))
-
-
-def get_open_positions_value() -> float:
-    """Laskee avointen positioiden yhteisarvon ostohintaan."""
-    try:
-        with open("open_positions.json", "r") as f:
-            positions = json.load(f).get("positions", [])
-        return sum(
-            float(p.get("buy_price", 0)) * float(p.get("amount", 0))
-            for p in positions
-        )
-    except Exception:
-        return 0.0
+        return float(os.getenv("CURRENT_BANKROLL_USDC", 100.0))
 
 
 def main():
     log.info("=" * 60)
-    log.info("Polymarket CopyTrader Scout käynnistyy (v5.0)...")
+    log.info("Polymarket CopyTrader Scout käynnistyy (v4.0)...")
     log.info("=" * 60)
 
     poll_interval        = int(os.getenv("POLL_INTERVAL_SECONDS", 1800))
@@ -81,19 +58,18 @@ def main():
     min_trades_48h       = int(os.getenv("MIN_TRADES_48H", 3))
     min_avg_size         = float(os.getenv("MIN_AVG_SIZE_USDC", 200))
     max_avg_size         = float(os.getenv("MAX_AVG_SIZE_USDC", 5000))
-    # BUG #3 KORJAUS: luetaan .env:stä, välitetään analyzerille
-    min_weight           = float(os.getenv("MIN_WALLET_WEIGHT", 0.4))
-    smart_threshold      = int(os.getenv("SMART_FOLLOW_THRESHOLD", 3))
-    min_signal_size      = float(os.getenv("MIN_SIGNAL_SIZE_USDC", 100000))
+    min_weight           = float(os.getenv("MIN_WALLET_WEIGHT", 0.7))
+    smart_threshold      = int(os.getenv("SMART_FOLLOW_THRESHOLD", 5))
+    min_signal_size      = float(os.getenv("MIN_SIGNAL_SIZE_USDC", 50000))
     max_orders_per_cycle = int(os.getenv("MAX_ORDERS_PER_CYCLE", 3))
-    min_bankroll         = float(os.getenv("MIN_BANKROLL_USDC", 50))
-    max_daily_loss       = float(os.getenv("MAX_DAILY_LOSS_USDC", 25))
+    min_bankroll         = float(os.getenv("MIN_BANKROLL_USDC", 80))
+    max_daily_loss       = float(os.getenv("MAX_DAILY_LOSS_USDC", 30))
     position_check_interval = int(os.getenv("POSITION_CHECK_SECONDS", 300))
 
     log.info(
         f"Asetukset: DRY_RUN={dry_run} | Poll={poll_interval}s | "
-        f"Threshold={smart_threshold} | MinWeight={min_weight} | "
-        f"MaxDailyLoss={max_daily_loss} USDC"
+        f"Threshold={smart_threshold} | Trades48h>={min_trades_48h} | "
+        f"MinWeight={min_weight}"
     )
 
     if dry_run:
@@ -107,17 +83,18 @@ def main():
         min_trades_48h=min_trades_48h,
         min_avg_size=min_avg_size,
         max_avg_size=max_avg_size,
-        min_weight=min_weight,   # BUG #3 KORJAUS
+        min_weight=min_weight
     )
     tracker = SignalTracker(smart_threshold=smart_threshold, dry_run=dry_run)
 
     today_str        = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     daily_spent_usdc = 0.0
 
+    import json as _json
     _spending_file = "daily_spending.json"
     try:
         with open(_spending_file) as f:
-            _data = json.load(f)
+            _data = _json.load(f)
             if _data.get("date") == today_str:
                 daily_spent_usdc = float(_data.get("spent", 0))
                 log.info(f"Ladattu päiväkulut: {daily_spent_usdc:.2f} USDC")
@@ -127,7 +104,7 @@ def main():
     def save_spending():
         try:
             with open(_spending_file, "w") as f:
-                json.dump({"date": today_str, "spent": daily_spent_usdc}, f)
+                _json.dump({"date": today_str, "spent": daily_spent_usdc}, f)
         except Exception:
             pass
 
@@ -142,6 +119,7 @@ def main():
             log.info("--- Uusi skannaus alkaa ---")
             cycle_start = time.time()
 
+            # Position check syklin alussa
             if not dry_run:
                 try:
                     from position_manager import check_and_exit_positions
@@ -149,15 +127,10 @@ def main():
                 except Exception as e:
                     log.warning(f"Position check epäonnistui: {e}")
 
+            # Bankroll-tarkistus
             if not dry_run:
-                bankroll     = get_bankroll_usdc()
-                open_val     = get_open_positions_value()
-                # BUG #2 KORJAUS: näytetään molemmat erikseen
-                log.info(
-                    f"💰 Kassa: {bankroll:.2f} USDC | "
-                    f"Avoimet positiot: {open_val:.2f} USDC | "
-                    f"Päiväkulut: {daily_spent_usdc:.2f}/{max_daily_loss:.0f} USDC"
-                )
+                bankroll = get_bankroll_usdc()
+                log.info(f"💰 Kassa: {bankroll:.2f} USDC | Päiväkulut: {daily_spent_usdc:.2f} USDC")
 
                 if bankroll < min_bankroll:
                     log.error(f"🛑 KASSA LIIAN MATALA: {bankroll:.2f} < {min_bankroll:.0f} USDC — DRY RUN päälle!")
@@ -178,10 +151,19 @@ def main():
                 history_cache = fetcher.get_wallet_history_cache() \
                     if hasattr(fetcher, "get_wallet_history_cache") else {}
 
-                # 2. Wallet scoring
+                # NOPEUTUS: Aja analyzer ensin ilman scoreja (perussuodatus)
+                # → scorataan vain kvalifioituneet lompakot, ei kaikkia 260+
+                log.info("Esikarsinta ennen scoringta...")
+                pre_qualified = analyzer.analyze(
+                    raw_trades,
+                    history_cache=history_cache,
+                    wallet_scores={}   # Ei scoreja vielä — pelkkä perussuodatus
+                )
+                log.info(f"Esikarsinta: {len(pre_qualified)} lompakkoa scoringiin (kaikista {len(history_cache)})")
+
+                # 2. Wallet scoring — vain esikarsitut lompakot
                 log.info("Lasketaan wallet scoret...")
-                all_wallets_temp = [{"address": addr} for addr in history_cache.keys()]
-                scores = score_wallets_batch(all_wallets_temp, history_cache)
+                scores = score_wallets_batch(pre_qualified, history_cache)
 
                 reliable_count    = sum(1 for s in scores.values() if s["reliable"])
                 high_weight_count = sum(1 for s in scores.values() if s["weight"] >= 1.5)
@@ -191,11 +173,11 @@ def main():
                     f"{high_weight_count} korkean painon"
                 )
 
-                # 3. Analyysi
+                # 3. Analyysi uudelleen — nyt scoret mukana järjestykseen
                 qualified_wallets = analyzer.analyze(
                     raw_trades,
                     history_cache=history_cache,
-                    wallet_scores=scores,
+                    wallet_scores=scores
                 )
                 log.info(f"Kvalifioituja lompakoita: {len(qualified_wallets)}")
 
@@ -207,7 +189,7 @@ def main():
                     for sig in signals[:20]:
                         log.info(
                             f"  🎯 {sig.get('question','')[:45]} | "
-                            f"Tuki: {sig['support_count']} / w={sig.get('weighted_support',0):.1f} | "
+                            f"Tuki: {sig['support_count']} lompakon | "
                             f"Outcome: {sig['outcome']} | "
                             f"Koko: {sig['total_size_usdc']:.0f} USDC"
                         )
@@ -229,12 +211,14 @@ def main():
                         success = tracker.execute_order(sig)
 
                         if success and not dry_run:
-                            actual_size = sig.get("_actual_order_size", float(os.getenv("MAX_ORDER_SIZE_USDC", 5)))
-                            if actual_size > 0:
-                                daily_spent_usdc += actual_size
-                                orders_this_cycle += 1
-                                save_spending()
-                                log.info(f"Päiväkulut: {daily_spent_usdc:.2f} USDC")
+                            actual_size = sig.get(
+                                "_actual_order_size",
+                                float(os.getenv("MAX_ORDER_SIZE_USDC", 5))
+                            )
+                            daily_spent_usdc += actual_size
+                            orders_this_cycle += 1
+                            save_spending()
+                            log.info(f"Päiväkulut: {daily_spent_usdc:.2f} USDC")
                         elif success and dry_run:
                             orders_this_cycle += 1
                 else:
@@ -249,6 +233,7 @@ def main():
         except Exception as e:
             log.error(f"Virhe pääsilmukassa: {e}", exc_info=True)
 
+        # Position check odotuksen aikana
         elapsed_wait = 0
         while elapsed_wait < poll_interval:
             sleep_chunk = min(position_check_interval, poll_interval - elapsed_wait)

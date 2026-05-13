@@ -65,13 +65,16 @@ def _get_winning_outcome(condition_id: str) -> Optional[str]:
     winner = _try_clob(condition_id)
     if winner is not None:
         _market_result_cache[condition_id] = winner
-        _save_cache_to_disk()
-        return winner
+        return winner  # Tallennetaan levylle batch_save:ssa
     winner = _try_gamma(condition_id)
     if winner is not None:
         _market_result_cache[condition_id] = winner
-        _save_cache_to_disk()
     return winner
+
+
+def _batch_save_cache():
+    """Tallentaa cachen levylle kerran kaikkien lompakkojen jälkeen."""
+    _save_cache_to_disk()
 
 
 def _try_clob(condition_id: str) -> Optional[str]:
@@ -204,6 +207,34 @@ def _default_score(address: str, checked: int = 0, correct: int = 0) -> Dict:
     }
 
 
+def _prefetch_outcomes(condition_ids: list):
+    """
+    Hakee puuttuvat markkinatulokset rinnakkain ThreadPoolExecutorilla.
+    Täyttää cachen ennen scoring-looppia — eliminoi peräkkäiset API-kutsut.
+    """
+    import os as _os
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    missing = [cid for cid in condition_ids if cid not in _market_result_cache]
+    if not missing:
+        return
+
+    max_workers = int(_os.getenv("SCORING_WORKERS", 10))
+    log.debug(f"Prefetch {len(missing)} markkinatulosta ({max_workers} rinnakkain)...")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_try_clob, cid): cid for cid in missing}
+        for future in as_completed(futures):
+            cid = futures[future]
+            try:
+                winner = future.result()
+                if winner is not None:
+                    _market_result_cache[cid] = winner
+                # Jos None → ei cacheta, yritetään Gammalla myöhemmin
+            except Exception:
+                pass
+
+
 def calculate_wallet_score(
     wallet_address: str,
     trade_history:  List[Dict],
@@ -214,6 +245,11 @@ def calculate_wallet_score(
     market_positions = _group_trades_by_market(trade_history)
     if not market_positions:
         return _default_score(wallet_address)
+
+    # Prefetch kaikki puuttuvat tulokset rinnakkain
+    all_cids = [cid for cid, sizes in list(market_positions.items())[:max_markets]
+                if not _is_market_maker(sizes)]
+    _prefetch_outcomes(all_cids)
 
     correct = checked = mm_skipped = 0
     total_roi_sum = weighted_roi_sum = total_usdc_checked = 0.0
@@ -275,6 +311,9 @@ def score_wallets_batch(
             high_scores.append(f"{addr[:10]} w={score['weight']} roi={score['weighted_roi']:+.0%} ({score['resolved_count']} mkts)")
         elif score["weight"] <= 0.8:
             low_scores.append(f"{addr[:10]} w={score['weight']} roi={score['weighted_roi']:+.0%} ({score['resolved_count']} mkts)")
+
+    # Tallenna cache kerran kaikkien lompakkojen jälkeen
+    _batch_save_cache()
 
     log.info(f"Wallet scoring valmis: {len(high_scores)} korkea | {len(low_scores)} matala | {no_data} ei dataa | {mm_total} MM-kauppaa suodatettu")
     if high_scores:
