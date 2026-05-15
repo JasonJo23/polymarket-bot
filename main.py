@@ -181,7 +181,14 @@ def main():
                 )
                 log.info(f"Kvalifioituja lompakoita: {len(qualified_wallets)}")
 
-                # 4. Signaalit
+                # 4. Tyhjennä edge detector cache — uusi sykli, uudet analyysit
+                try:
+                    from edge_detector import EdgeDetector as _ED
+                    _ED().clear_cache()
+                except Exception:
+                    pass
+
+                # 5. Signaalit
                 signals = tracker.process(qualified_wallets, raw_trades, wallet_scores=scores)
 
                 if signals:

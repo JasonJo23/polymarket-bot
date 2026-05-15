@@ -1,31 +1,30 @@
 """
 =============================================================================
-edge_detector.py – EdgeDetector  (v1.0)
+edge_detector.py – EdgeDetector  (v2.0)
 =============================================================================
-STRATEGIA:
-  Integraatiopiste joka yhdistää:
-    1. SportDataFetcher   → kontekstidata
-    2. ProbabilityEngine  → oma todennäköisyys
-    3. Päätöslogiikka     → ostaako vai ei
+KORJAUKSET v1.0 → v2.0:
 
-  Kutsutaan tracker.py:n execute_order():sta ENNEN CLOB-ostoa.
-  Jos edge löytyy → osta.
-  Jos ei edgeä → ohita vaikka konsensus sanoisi osta.
+  BUG #1  Sama kysymys+outcome analysoitu 20+ kertaa per päivä
+          → Barcelona analysoitu 20x, Girona 15x — turhat API-kulut
+          → KORJAUS: analyysicache per sykli — sama kysymys+outcome
+            analysoidaan vain KERRAN per sykli
 
-PÄÄTÖSLOGIIKKA:
-  Osta jos KAIKKI seuraavat toteutuvat:
-    1. Oma todennäköisyys > Polymarket-hinta + MIN_EDGE (oletus 5%)
-    2. Confidence != "low"
-    3. Data quality >= MIN_DATA_QUALITY (oletus 0.3)
-    4. Token-hinta välillä MIN_TOKEN_PRICE - MAX_TOKEN_PRICE
+  BUG #2  MIN_EDGE_THRESHOLD=0.05 liian matala
+          → 0.025 edge hyväksyttiin vaikka se on lähes satunnainen
+          → KORJAUS: oletusarvo nostettu 0.08:aan
+            Vain selkeät edget (>8%) johtavat ostoon
 
-  Tämä on konservatiivinen — mieluummin ohitetaan hyvä kauppa
-  kuin ostetaan huono.
+  BUG #3  confidence="low" esti ostamisen vaikka edge oli suuri
+          → US-Iran NO +0.195 edgellä ostettu oikein
+          → Mutta NaVi +0.185 conf=medium hyväksytty — OK
+          → KORJAUS: jos edge >= 0.15 ja conf != "low" → osta
+            jos edge >= 0.20 → osta vaikka conf="low" (selkeä virhe markkinassa)
 =============================================================================
 """
 
 import os
 import logging
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
 log = logging.getLogger("Scout.EdgeDetector")
@@ -34,21 +33,18 @@ log = logging.getLogger("Scout.EdgeDetector")
 class EdgeDetector:
 
     def __init__(self):
-        self.min_edge         = float(os.getenv("MIN_EDGE_THRESHOLD", 0.05))
+        self.min_edge         = float(os.getenv("MIN_EDGE_THRESHOLD", 0.08))
         self.min_data_quality = float(os.getenv("MIN_DATA_QUALITY", 0.3))
         self.min_token_price  = float(os.getenv("MIN_TOKEN_PRICE", 0.25))
         self.max_token_price  = float(os.getenv("MAX_TOKEN_PRICE", 0.80))
         self.enabled          = os.getenv("EDGE_DETECTOR_ENABLED", "true").lower() == "true"
 
-        # Lazy init — luodaan vasta tarvittaessa
-        self._news_fetcher       = None
-        self._probability_engine = None
+        # BUG #1 KORJAUS: analyysicache per sykli
+        # key = "question|outcome" → result dict
+        self._analysis_cache: Dict[str, Dict] = {}
+        self._cache_created = datetime.now(timezone.utc)
 
-    def _get_news_fetcher(self):
-        if self._news_fetcher is None:
-            from news_fetcher import SportDataFetcher
-            self._news_fetcher = SportDataFetcher()
-        return self._news_fetcher
+        self._probability_engine = None
 
     def _get_probability_engine(self):
         if self._probability_engine is None:
@@ -56,48 +52,39 @@ class EdgeDetector:
             self._probability_engine = ProbabilityEngine()
         return self._probability_engine
 
-    # ===========================================================================
-    # Päämetodi
-    # ===========================================================================
+    def clear_cache(self):
+        """Tyhjentää analyysicachen — kutsutaan jokaisen syklin alussa."""
+        old_size = len(self._analysis_cache)
+        self._analysis_cache.clear()
+        self._cache_created = datetime.now(timezone.utc)
+        if old_size > 0:
+            log.debug(f"Analyysicache tyhjennetty ({old_size} merkintää)")
 
     def should_buy(
         self,
         signal:      Dict[str, Any],
         token_price: float
     ) -> Dict[str, Any]:
-        """
-        Päättää ostaako signaalin perusteella.
-
-        Args:
-            signal:      Tracker.process():n palauttama signaali
-            token_price: Nykyinen token-hinta Polymarketilla
-
-        Returns:
-            {
-                "approved":        bool,
-                "reason":          str,
-                "edge":            float,
-                "our_probability": float,
-                "confidence":      str,
-            }
-        """
         question = signal.get("question", "")
         outcome  = signal.get("outcome", "")
 
-        # Jos edge detector ei ole käytössä → hyväksy kaikki (fallback vanhaan logiikkaan)
         if not self.enabled:
-            return self._approve(f"EdgeDetector ei käytössä — hyväksytään konsensuksen perusteella")
+            return self._approve("EdgeDetector ei käytössä")
 
         # Hintatarkistus
         if token_price < self.min_token_price:
-            return self._reject(f"Hinta liian matala ({token_price:.3f} < {self.min_token_price}) — longshot riski")
-
+            return self._reject(f"Hinta liian matala ({token_price:.3f} < {self.min_token_price})")
         if token_price > self.max_token_price:
-            return self._reject(f"Hinta liian korkea ({token_price:.3f} > {self.max_token_price}) — ei edgeä")
+            return self._reject(f"Hinta liian korkea ({token_price:.3f} > {self.max_token_price})")
 
-        # Luo minimikonteksti — ulkoiset lähteet blokattu verkossa
-        # Claude analysoi pelkän kysymyksen ja hinnan perusteella
-        from datetime import datetime, timezone as _tz
+        # BUG #1 KORJAUS: tarkista cache ensin
+        cache_key = f"{question}|{outcome}"
+        if cache_key in self._analysis_cache:
+            cached = self._analysis_cache[cache_key]
+            log.debug(f"Cache hit: {question[:40]} → edge={cached.get('edge',0):+.2f}")
+            return cached
+
+        # Luo konteksti
         context = {
             "sport":        self._detect_sport(question),
             "home_team":    "",
@@ -107,10 +94,9 @@ class EdgeDetector:
             "h2h":          [],
             "news":         [],
             "lineup_notes": [],
-            "data_quality": 0.5,  # Neutraali — Claude toimii ilman ulkoista dataa
-            "fetched_at":   datetime.now(_tz.utc).isoformat(),
+            "data_quality": 0.5,
+            "fetched_at":   datetime.now(timezone.utc).isoformat(),
         }
-        data_quality = 0.5
 
         # Laske todennäköisyys
         try:
@@ -118,14 +104,26 @@ class EdgeDetector:
             result = prob_engine.calculate_edge(question, outcome, token_price, context)
         except Exception as e:
             log.warning(f"Probability laskenta epäonnistui: {e}")
-            return self._approve(f"Probability engine epäonnistui — hyväksytään konservatiivisesti")
+            fallback = self._approve("Probability engine epäonnistui — hyväksytään")
+            self._analysis_cache[cache_key] = fallback
+            return fallback
 
-        result["data_quality"] = data_quality
+        result["data_quality"] = 0.5
         edge       = result.get("edge", 0.0)
         our_prob   = result.get("our_probability", token_price)
         confidence = result.get("confidence", "low")
         reasoning  = result.get("reasoning", "")
-        should_bet = result.get("should_bet", False)
+
+        # BUG #2+#3 KORJAUS: parannettu päätöslogiikka
+        # Osta jos:
+        #   - edge >= min_edge (0.08) JA confidence != "low"
+        #   - TAI edge >= 0.15 JA confidence = "medium"
+        #   - TAI edge >= 0.20 (selkeä virhe markkinassa — osta vaikka conf=low)
+        should_bet = (
+            (edge >= self.min_edge and confidence != "low") or
+            (edge >= 0.15 and confidence == "medium") or
+            (edge >= 0.20)
+        )
 
         if should_bet:
             reason = (
@@ -133,7 +131,7 @@ class EdgeDetector:
                 f"edge={edge:+.2f} conf={confidence} | {reasoning[:80]}"
             )
             log.info(f"✅ EdgeDetector: {question[:40]} → {reason}")
-            return {
+            final = {
                 "approved":        True,
                 "reason":          reason,
                 "edge":            edge,
@@ -146,7 +144,7 @@ class EdgeDetector:
                 f"edge={edge:+.2f} conf={confidence} | {reasoning[:80]}"
             )
             log.info(f"⏭️  EdgeDetector ohitti: {question[:40]} → {reason}")
-            return {
+            final = {
                 "approved":        False,
                 "reason":          reason,
                 "edge":            edge,
@@ -154,42 +152,24 @@ class EdgeDetector:
                 "confidence":      confidence,
             }
 
-    # ===========================================================================
-    # Apumetodit
-    # ===========================================================================
+        # Tallenna cacheen
+        self._analysis_cache[cache_key] = final
+        return final
 
     def _detect_sport(self, question: str) -> str:
         q = question.lower()
-        if any(k in q for k in ["lol:", "cs2", "csgo", "valorant", "dota", "esports", "lck", "lec"]):
+        if any(k in q for k in ["lol:", "cs2", "csgo", "valorant", "dota", "esports", "lck", "lec", "counter-strike"]):
             return "esports"
-        if any(k in q for k in ["lakers", "celtics", "knicks", "nba", "thunder", "spurs", "76ers"]):
+        if any(k in q for k in ["lakers", "celtics", "knicks", "nba", "thunder", "spurs", "76ers", "cavaliers", "pistons", "timberwolves"]):
             return "nba"
-        if any(k in q for k in ["fc ", "arsenal", "chelsea", "liverpool", "madrid", "barcelona"]):
+        if any(k in q for k in ["fc ", "arsenal", "chelsea", "liverpool", "madrid", "barcelona", "premier league", "la liga"]):
             return "football"
-        if any(k in q for k in ["trump", "biden", "iran", "election", "fed", "btc", "eth"]):
+        if any(k in q for k in ["trump", "biden", "iran", "election", "fed", "btc", "eth", "tariff", "ceasefire"]):
             return "politics/macro"
         return "general"
 
-    def _approve(
-        self,
-        reason:           str,
-        edge:             float = 0.0,
-        our_probability:  float = 0.5,
-        confidence:       str   = "medium"
-    ) -> Dict:
-        return {
-            "approved":        True,
-            "reason":          reason,
-            "edge":            edge,
-            "our_probability": our_probability,
-            "confidence":      confidence,
-        }
+    def _approve(self, reason: str, edge: float = 0.0, our_probability: float = 0.5, confidence: str = "medium") -> Dict:
+        return {"approved": True, "reason": reason, "edge": edge, "our_probability": our_probability, "confidence": confidence}
 
     def _reject(self, reason: str) -> Dict:
-        return {
-            "approved":        False,
-            "reason":          reason,
-            "edge":            0.0,
-            "our_probability": 0.0,
-            "confidence":      "low",
-        }
+        return {"approved": False, "reason": reason, "edge": 0.0, "our_probability": 0.0, "confidence": "low"}
