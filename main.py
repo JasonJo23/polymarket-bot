@@ -58,7 +58,7 @@ def main():
     min_trades_48h       = int(os.getenv("MIN_TRADES_48H", 3))
     min_avg_size         = float(os.getenv("MIN_AVG_SIZE_USDC", 200))
     max_avg_size         = float(os.getenv("MAX_AVG_SIZE_USDC", 5000))
-    min_weight           = float(os.getenv("MIN_WALLET_WEIGHT", 0.7))
+    min_weight           = float(os.getenv("MIN_WALLET_WEIGHT", 0.4))
     smart_threshold      = int(os.getenv("SMART_FOLLOW_THRESHOLD", 5))
     min_signal_size      = float(os.getenv("MIN_SIGNAL_SIZE_USDC", 50000))
     max_orders_per_cycle = int(os.getenv("MAX_ORDERS_PER_CYCLE", 3))
@@ -181,10 +181,11 @@ def main():
                 )
                 log.info(f"Kvalifioituja lompakoita: {len(qualified_wallets)}")
 
-                # 4. Tyhjennä edge detector cache — uusi sykli, uudet analyysit
+                # 4. Tyhjennä edge detector singleton cache — uusi sykli
                 try:
-                    from edge_detector import EdgeDetector as _ED
-                    _ED().clear_cache()
+                    import tracker as _tracker_module
+                    if hasattr(_tracker_module, "_edge_detector_instance") and _tracker_module._edge_detector_instance:
+                        _tracker_module._edge_detector_instance.clear_cache()
                 except Exception:
                     pass
 

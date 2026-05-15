@@ -38,6 +38,14 @@ try:
 except Exception:
     notifier = None
 
+# EdgeDetector singleton — yksi instanssi koko sovellukselle
+# Näin cache toimii oikein eikä tyhjenee joka kutsussa
+try:
+    from edge_detector import EdgeDetector as _EdgeDetector
+    _edge_detector_instance = _EdgeDetector()
+except Exception:
+    _edge_detector_instance = None
+
 log = logging.getLogger("Scout.Tracker")
 
 CLOB_BASE  = "https://clob.polymarket.com"
@@ -374,8 +382,10 @@ class SignalTracker:
 
             # Edge detector — oma AI-analyysi vs Polymarket-hinta
             try:
-                from edge_detector import EdgeDetector
-                edge_det = EdgeDetector()
+                edge_det = _edge_detector_instance
+                if edge_det is None:
+                    from edge_detector import EdgeDetector
+                    edge_det = EdgeDetector()
                 edge_result = edge_det.should_buy(signal, token_price)
                 if not edge_result["approved"]:
                     log.info(f"⏭️  EdgeDetector ohitti: {edge_result['reason'][:80]}")

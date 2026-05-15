@@ -1,4 +1,5 @@
 requests
 python-dotenv
-polymarket-apis
 py-clob-client
+py-clob-client-v2
+feedparser
