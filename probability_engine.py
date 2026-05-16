@@ -213,7 +213,7 @@ OHJE:
 - Esports: joukkueiden taso, turnausmuoto (BO1/BO3/BO5), meta
 - NBA/urheilu: joukkueiden vire, playoff-tilanne, loukkaantumiset
 - Politiikka/makro: historiallinen todennäköisyys, nykytilanne
-- Crypto: onko kynnysarvo realistinen nykyhintoihin nähden
+- Crypto: Polymarket-hinta on paras saatavilla oleva arvio. Jos YES @ 0.49 se tarkoittaa markkinat uskovat 49% todennäköisyyteen. ÄLÄ arvaile krypton nykyistä hintaa — käytä Polymarket-hintaa lähtökohtana.
 - Jos et tiedä tarpeeksi → conf "low", our_probability lähelle Polymarket-hintaa
 - Edge syntyy VAIN kun tiedät jotain mitä hinta ei heijasta
 
