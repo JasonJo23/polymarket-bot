@@ -177,29 +177,52 @@ class ProbabilityEngine:
         context_sections = [s for s in [injury_text, form_text, h2h_text, news_text, lineup_text] if s]
         context_str = "\n\n".join(context_sections) if context_sections else "Ei lisädataa saatavilla."
 
+        # Hae Polymarket-konteksti jos saatavilla
+        polymarket_context = context.get("context_text", "")
+        opponents    = context.get("opponents", "")
+        tournament   = context.get("tournament", "")
+        crypto_price = context.get("crypto_price", 0.0)
+
+        # Rakenna kontekstiosio promptiin
+        context_section = ""
+        if polymarket_context and polymarket_context != "Ei lisäkontekstia saatavilla Polymarket API:sta.":
+            context_section = "POLYMARKET-KONTEKSTI:\n" + polymarket_context + "\n"
+        elif context_str and context_str != "Ei lisädataa saatavilla.":
+            context_section = "SAATAVILLA OLEVA DATA:\n" + context_str + "\n"
+        else:
+            context_section = "Ei ulkoista dataa — käytä yleistietoa ja Polymarket-hintaa lähtökohtana.\n"
+
+        # Crypto-spesifinen konteksti
+        crypto_section = ""
+        if crypto_price > 0:
+            crypto_section = "HUOMIO: Markkinan kynnysarvo on $" + f"{crypto_price:,.0f}" + ". Arvioi onko tämä realistinen.\n"
+
         prompt = f"""Olet prediction market -analyytikko. Arvioi todennäköisyys markkinalle.
 
 MARKKINA: {question}
 ARVIOITAVA OUTCOME: {outcome}
 POLYMARKET-HINTA: {polymarket_price:.3f} ({polymarket_price*100:.1f}%)
 LAJI: {sport}
+{f"OTTELU: {opponents}" if opponents else ""}
+{f"TURNAUS: {tournament}" if tournament else ""}
 
-{context_str if context_str != "Ei lisädataa saatavilla." else "Ei ulkoista dataa saatavilla — käytä yleistietoa."}
-
+{context_section}{crypto_section}
 OHJE:
-- Arvioi onko Polymarket-hinta oikein vai väärin
-- Esports: analysoi joukkueiden tasoerot ja turnausmuoto
-- NBA: analysoi joukkueiden vire ja matchup
-- Politiikka/makro: analysoi todennäköisyys taustatiedon perusteella
-- Jos et tiedä tarpeeksi → anna confidence "low" ja our_probability lähelle Polymarket-hintaa
-- Edge syntyy vain kun tiedät jotain mitä hinta ei heijasta
+- Arvioi onko Polymarket-hinta oikein vai väärin käyttäen kaikkea saatavilla olevaa tietoa
+- Jos vastustaja on tiedossa: analysoi tasoero, muoto, kotietua
+- Esports: joukkueiden taso, turnausmuoto (BO1/BO3/BO5), meta
+- NBA/urheilu: joukkueiden vire, playoff-tilanne, loukkaantumiset
+- Politiikka/makro: historiallinen todennäköisyys, nykytilanne
+- Crypto: onko kynnysarvo realistinen nykyhintoihin nähden
+- Jos et tiedä tarpeeksi → conf "low", our_probability lähelle Polymarket-hintaa
+- Edge syntyy VAIN kun tiedät jotain mitä hinta ei heijasta
 
 Vastaa VAIN JSON, ei muuta tekstiä:
 {{
   "our_probability": <0.0-1.0>,
   "confidence": "<high|medium|low>",
-  "reasoning": "<max 100 merkkiä>",
-  "key_factors": ["<tekijä>"]
+  "reasoning": "<max 120 merkkiä, konkreettinen>",
+  "key_factors": ["<tekijä 1>", "<tekijä 2>"]
 }}"""
 
         return prompt

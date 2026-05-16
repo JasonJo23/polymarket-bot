@@ -57,6 +57,12 @@ class EdgeDetector:
         old_size = len(self._analysis_cache)
         self._analysis_cache.clear()
         self._cache_created = datetime.now(timezone.utc)
+        # Tyhjennä myös market context cache
+        try:
+            from market_context import clear_context_cache
+            clear_context_cache()
+        except Exception:
+            pass
         if old_size > 0:
             log.debug(f"Analyysicache tyhjennetty ({old_size} merkintää)")
 
@@ -84,7 +90,17 @@ class EdgeDetector:
             log.debug(f"Cache hit: {question[:40]} → edge={cached.get('edge',0):+.2f}")
             return cached
 
-        # Luo konteksti
+        # Hae reaaliaikainen konteksti Polymarket API:sta
+        market_ctx = {}
+        try:
+            from market_context import get_market_context
+            market_ctx = get_market_context(
+                question=question,
+                token_price=token_price,
+            )
+        except Exception as e:
+            log.debug(f"Market context haku epäonnistui: {e}")
+
         context = {
             "sport":        self._detect_sport(question),
             "home_team":    "",
@@ -94,8 +110,14 @@ class EdgeDetector:
             "h2h":          [],
             "news":         [],
             "lineup_notes": [],
-            "data_quality": 0.5,
+            "data_quality": market_ctx.get("data_quality", 0.5),
             "fetched_at":   datetime.now(timezone.utc).isoformat(),
+            # Lisää Polymarket-konteksti
+            "opponents":    market_ctx.get("opponents", ""),
+            "tournament":   market_ctx.get("tournament", ""),
+            "description":  market_ctx.get("description", ""),
+            "crypto_price": market_ctx.get("crypto_price", 0.0),
+            "context_text": market_ctx.get("context_text", ""),
         }
 
         # Laske todennäköisyys
