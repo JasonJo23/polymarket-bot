@@ -30,6 +30,13 @@ from collections import defaultdict
 
 log = logging.getLogger("Scout.Tracker")
 
+# EdgeDetector singleton — yksi instanssi koko sovellukselle
+try:
+    from edge_detector import EdgeDetector as _EdgeDetector
+    _edge_detector_instance = _EdgeDetector()
+except Exception:
+    _edge_detector_instance = None
+
 CLOB_BASE  = "https://clob.polymarket.com"
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 
@@ -320,23 +327,8 @@ class SignalTracker:
         except Exception:
             pass
 
-        # Kelly-tyyppinen position sizing — suurempi panos kun edge ja confidence ovat vahvempia
-        # _edge ja _confidence asetetaan EdgeDetectorissa jos käytössä
-        _edge_val  = abs(signal.get("_edge", 0.0))
-        _conf      = signal.get("_confidence", "medium")  # Oletus medium jos ei EdgeDetector
-
-        if _conf == "high" and _edge_val >= 0.20:
-            _size_pct = 1.5   # 30 USDC (150% max)
-        elif _conf == "high" and _edge_val >= 0.10:
-            _size_pct = 1.0   # 20 USDC (100% max)
-        elif _conf == "medium" and _edge_val >= 0.08:
-            _size_pct = 0.75  # 15 USDC (75% max)
-        else:
-            _size_pct = 0.5   # 10 USDC (50% max)
-
-        order_size = min(self.max_order_usdc * _size_pct, signal["total_size_usdc"] * 0.01)
+        order_size = min(self.max_order_usdc, signal["total_size_usdc"] * 0.01)
         order_size = max(round(order_size, 2), 1.0)
-        log.debug(f"Position sizing: conf={_conf} edge={_edge_val:.2f} → {order_size:.1f} USDC ({_size_pct*100:.0f}% max)")
 
         if self.dry_run:
             log.info(
@@ -420,6 +412,22 @@ class SignalTracker:
                     return False
             except Exception as e:
                 log.debug(f"Intelligence epäonnistui: {e}")
+
+            # EdgeDetector — Claude API analysoi edgen
+            try:
+                edge_det = _edge_detector_instance
+                if edge_det is None:
+                    from edge_detector import EdgeDetector
+                    edge_det = EdgeDetector()
+                edge_result = edge_det.should_buy(signal, token_price)
+                if not edge_result["approved"]:
+                    log.info(f"⏭️  EdgeDetector ohitti: {edge_result['reason'][:80]}")
+                    return False
+                signal["_edge"]       = edge_result.get("edge", 0.0)
+                signal["_confidence"] = edge_result.get("confidence", "medium")
+                log.info(f"✅ EdgeDetector hyväksyi: edge={edge_result.get('edge',0):+.2f} conf={edge_result.get('confidence','?')}")
+            except Exception as e:
+                log.debug(f"EdgeDetector epäonnistui — jatketaan ilman: {e}")
 
             # Tick size
             try:
