@@ -422,7 +422,19 @@ class SignalTracker:
                     return False
             except Exception as e:
                 log.debug(f"Intelligence epäonnistui: {e}")
-
+# EdgeDetector — Claude API analysoi edgen
+            try:
+                from edge_detector import EdgeDetector as _ED
+                _ed = _ED()
+                edge_result = _ed.should_buy(signal, token_price)
+                if not edge_result["approved"]:
+                    log.info(f"⏭️  EdgeDetector ohitti: {edge_result['reason'][:80]}")
+                    return False
+                signal["_edge"]       = edge_result.get("edge", 0.0)
+                signal["_confidence"] = edge_result.get("confidence", "medium")
+                log.info(f"✅ EdgeDetector hyväksyi: edge={edge_result.get('edge',0):+.2f} conf={edge_result.get('confidence','?')}")
+            except Exception as e:
+                log.debug(f"EdgeDetector epäonnistui — jatketaan ilman: {e}")
             # Tick size
             try:
                 r_tick = requests.get(
