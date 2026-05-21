@@ -236,7 +236,14 @@ class PolymarketFetcher:
             if not cid:
                 continue
 
-            # Hae top-holderit — activity per markkina ei toimi Polymarket API:ssa
+            recent_trades = self._fetch_market_recent_trades(cid, cutoff_ts)
+            for trade in recent_trades:
+                side = str(trade.get("side", "")).upper()
+                addr = self._extract_address(trade)
+                if side == "BUY" and addr:
+                    wallets_spike.add(addr)
+
+            # Hae top-holderit fallbackiksi ja scoringin historian lähteeksi.
             data = self._get(f"{DATA_BASE}/holders", {
                 "market": cid,
                 "limit":  self.top_holders,
@@ -247,7 +254,6 @@ class PolymarketFetcher:
                         addr = h.get("proxyWallet", "")
                         if addr and addr.startswith("0x") and len(addr) == 42:
                             wallets_holders.add(addr.lower())
-                            wallets_spike.add(addr.lower())
 
             time.sleep(self.request_delay)
 
@@ -267,6 +273,30 @@ class PolymarketFetcher:
         )
         return combined
 
+    def _fetch_market_recent_trades(self, condition_id: str, cutoff_ts: int) -> List[Dict]:
+        """Hakee markkinan tuoreet treidit ja palauttaa vain cutoffin jälkeiset."""
+        data = self._get(f"{DATA_BASE}/activity", {
+            "market":        condition_id,
+            "type":          "TRADE",
+            "sortBy":        "TIMESTAMP",
+            "sortDirection": "DESC",
+            "limit":         int(os.getenv("MARKET_ACTIVITY_LIMIT", 100)),
+        })
+        if not data:
+            return []
+
+        trades = data if isinstance(data, list) else data.get("data", [])
+        recent = []
+        for trade in trades:
+            trade_cid = self._extract_condition_id(trade)
+            if trade_cid != condition_id:
+                continue
+            ts = self._ts(trade)
+            if ts is None or int(ts.timestamp()) < cutoff_ts:
+                continue
+            recent.append(trade)
+        return recent
+
     def _fetch_wallet_activity(self, wallet: str, limit: int = 100) -> List[Dict]:
         """Hakee lompakon kauppahistorian."""
         data = self._get(f"{DATA_BASE}/activity", {
@@ -279,6 +309,20 @@ class PolymarketFetcher:
         if not data:
             return []
         return data if isinstance(data, list) else data.get("data", [])
+
+    def _extract_address(self, trade: Dict) -> Optional[str]:
+        for key in ("proxyWallet", "proxy_wallet", "maker", "user"):
+            val = trade.get(key)
+            if val and isinstance(val, str) and val.startswith("0x") and len(val) == 42:
+                return val.lower()
+        return None
+
+    def _extract_condition_id(self, trade: Dict) -> Optional[str]:
+        for key in ("conditionId", "condition_id", "market", "marketId"):
+            val = trade.get(key)
+            if val and isinstance(val, str):
+                return val
+        return None
 
     # ------------------------------------------------------------------
     # Apumetodit

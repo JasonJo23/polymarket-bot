@@ -33,6 +33,16 @@ log = logging.getLogger("Scout.Tracker")
 CLOB_BASE  = "https://clob.polymarket.com"
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 
+_edge_detector_instance = None
+
+
+def _get_edge_detector():
+    global _edge_detector_instance
+    if _edge_detector_instance is None:
+        from edge_detector import EdgeDetector
+        _edge_detector_instance = EdgeDetector()
+    return _edge_detector_instance
+
 
 def get_usdc_balance_v2() -> float:
     """Hakee USDC-saldon suoraan REST-kutsulla (v2 API)."""
@@ -262,7 +272,7 @@ class SignalTracker:
                     signals.append({
                         "market_id":        market_id,
                         "question":         question,
-                        "end_date":         end_date[:10] if end_date else "?",
+                        "end_date":         end_date if end_date else "?",
                         "outcome":          outcome,
                         "support_count":    len(unique_wallets),
                         "weighted_support": round(weighted_support, 2),
@@ -320,28 +330,7 @@ class SignalTracker:
         except Exception:
             pass
 
-        order_size = min(self.max_order_usdc, signal["total_size_usdc"] * 0.01)
-        order_size = max(round(order_size, 2), 1.0)
-
-        if self.dry_run:
-            log.info(
-                f"[DRY RUN] {signal.get('question','')[:35]} | "
-                f"{signal['outcome']} | {order_size} USDC | "
-                f"w_support={signal.get('weighted_support', '?')}"
-            )
-            self._executed_today.add(sig_key)
-            self._save_executed()
-            return True
-
-        if not os.getenv("CLOB_API_KEY"):
-            log.error("CLOB_API_KEY puuttuu.")
-            return False
-
         try:
-            from py_clob_client_v2 import (
-                ClobClient, ApiCreds, MarketOrderArgs, OrderArgs,
-                OrderType, Side, PartialCreateOrderOptions
-            )
             from intelligence import _is_sports as _check_sports
 
             condition_id = signal["market_id"]
@@ -400,6 +389,9 @@ class SignalTracker:
                 log.warning(f"Hinta {token_price} äärimmäinen — ohitetaan.")
                 return False
 
+            signal["token_id"] = token_id
+            signal["token_price"] = token_price
+
             # Tarkista CLOB:sta onko markkina vielä aktiivinen
             try:
                 import time as _time
@@ -424,21 +416,54 @@ class SignalTracker:
                 if not intel["approved"]:
                     log.warning(f"Intelligence hylkäsi: {intel['reason']}")
                     return False
+                signal["intelligence"] = intel
             except Exception as e:
                 log.debug(f"Intelligence epäonnistui: {e}")
-# EdgeDetector — Claude API analysoi edgen
             try:
-                from edge_detector import EdgeDetector as _ED
-                _ed = _ED()
-                edge_result = _ed.should_buy(signal, token_price)
-                if not edge_result["approved"]:
-                    log.info(f"⏭️  EdgeDetector ohitti: {edge_result['reason'][:80]}")
+                edge_result = _get_edge_detector().should_buy(signal, token_price)
+                signal["edge"] = edge_result
+                if not edge_result.get("approved", False):
+                    log.warning(f"EdgeDetector hylkäsi: {edge_result.get('reason', '')}")
                     return False
-                signal["_edge"]       = edge_result.get("edge", 0.0)
-                signal["_confidence"] = edge_result.get("confidence", "medium")
-                log.info(f"✅ EdgeDetector hyväksyi: edge={edge_result.get('edge',0):+.2f} conf={edge_result.get('confidence','?')}")
             except Exception as e:
-                log.debug(f"EdgeDetector epäonnistui — jatketaan ilman: {e}")
+                if os.getenv("EDGE_DETECTOR_FAIL_OPEN", "false").lower() == "true":
+                    log.warning(f"EdgeDetector epäonnistui, fail-open: {e}")
+                    edge_result = {
+                        "approved": True,
+                        "reason": "EdgeDetector fail-open",
+                        "edge": 0.0,
+                        "our_probability": token_price,
+                        "confidence": "low",
+                    }
+                    signal["edge"] = edge_result
+                else:
+                    log.warning(f"EdgeDetector epäonnistui — ohitetaan signaali: {e}")
+                    return False
+
+            order_size = self._calculate_order_size(signal)
+
+            if self.dry_run:
+                edge = signal.get("edge", {})
+                log.info(
+                    f"[DRY RUN] {signal.get('question','')[:35]} | "
+                    f"{signal['outcome']} | {order_size} USDC | "
+                    f"w_support={signal.get('weighted_support', '?')} | "
+                    f"edge={edge.get('edge', 0):+.3f} conf={edge.get('confidence', '?')}"
+                )
+                self._executed_today.add(sig_key)
+                self._save_executed()
+                signal["_actual_order_size"] = 0
+                return True
+
+            if not os.getenv("CLOB_API_KEY"):
+                log.error("CLOB_API_KEY puuttuu.")
+                return False
+
+            from py_clob_client_v2 import (
+                ClobClient, ApiCreds, MarketOrderArgs, OrderArgs,
+                OrderType, Side, PartialCreateOrderOptions
+            )
+
             # Tick size
             try:
                 r_tick = requests.get(
@@ -541,6 +566,33 @@ class SignalTracker:
     # ------------------------------------------------------------------
     # Apumetodit
     # ------------------------------------------------------------------
+
+    def _calculate_order_size(self, signal: Dict[str, Any]) -> float:
+        """Skaalaa panos konsensuksen, edgen ja confidence-tason mukaan."""
+        base_size = min(self.max_order_usdc, signal["total_size_usdc"] * 0.01)
+        edge_info = signal.get("edge") or {}
+        edge = max(0.0, float(edge_info.get("edge", 0.0) or 0.0))
+        confidence = str(edge_info.get("confidence", "medium")).lower()
+
+        edge_multiplier = 1.0
+        if edge >= 0.20:
+            edge_multiplier = 1.5
+        elif edge >= 0.15:
+            edge_multiplier = 1.3
+        elif edge >= 0.10:
+            edge_multiplier = 1.15
+
+        confidence_multiplier = {
+            "high": 1.25,
+            "medium": 1.0,
+            "low": 0.65,
+        }.get(confidence, 1.0)
+
+        weighted_support = float(signal.get("weighted_support", 1.0) or 1.0)
+        support_multiplier = min(1.3, max(0.8, weighted_support / max(self.smart_threshold, 1)))
+
+        size = base_size * edge_multiplier * confidence_multiplier * support_multiplier
+        return max(round(min(size, self.max_order_usdc), 2), 1.0)
 
     def _get_market_info_clob(self, condition_id: str) -> Optional[Dict]:
         if condition_id in self._market_cache:

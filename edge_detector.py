@@ -96,6 +96,8 @@ class EdgeDetector:
             from market_context import get_market_context
             market_ctx = get_market_context(
                 question=question,
+                condition_id=signal.get("market_id", ""),
+                token_id=signal.get("token_id", ""),
                 token_price=token_price,
             )
         except Exception as e:
@@ -126,7 +128,10 @@ class EdgeDetector:
             result = prob_engine.calculate_edge(question, outcome, token_price, context)
         except Exception as e:
             log.warning(f"Probability laskenta epäonnistui: {e}")
-            fallback = self._approve("Probability engine epäonnistui — hyväksytään")
+            if os.getenv("EDGE_DETECTOR_FAIL_OPEN", "false").lower() == "true":
+                fallback = self._approve("Probability engine epäonnistui — fail-open")
+            else:
+                fallback = self._reject("Probability engine epäonnistui — fail-closed")
             self._analysis_cache[cache_key] = fallback
             return fallback
 

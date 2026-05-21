@@ -221,6 +221,9 @@ def add_position(signal: Dict, token_id: str, buy_price: float, amount: float, e
             log.debug(f"Positio jo olemassa: {token_id[:16]}")
             return
 
+    edge = signal.get("edge") or {}
+    intelligence = signal.get("intelligence") or {}
+
     position = {
         "market_id":  signal.get("market_id", ""),
         "question":   signal.get("question", "")[:60],
@@ -231,6 +234,15 @@ def add_position(signal: Dict, token_id: str, buy_price: float, amount: float, e
         "end_date":   end_date,
         "is_sports":  _is_sports(signal.get("question", "")),
         "bought_at":  datetime.now(timezone.utc).isoformat(),
+        "support_count":    signal.get("support_count", 0),
+        "weighted_support": signal.get("weighted_support", 0),
+        "total_size_usdc":  signal.get("total_size_usdc", 0),
+        "edge":             edge.get("edge", 0.0),
+        "our_probability":  edge.get("our_probability", buy_price),
+        "edge_confidence":  edge.get("confidence", ""),
+        "edge_reason":      edge.get("reason", ""),
+        "market_quality":   intelligence.get("market_quality", 0.0),
+        "intel_confidence": intelligence.get("confidence", 0.0),
     }
     positions.append(position)
     save_positions(positions)
