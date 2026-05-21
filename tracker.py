@@ -347,7 +347,11 @@ class SignalTracker:
             condition_id = signal["market_id"]
             outcome_name = signal["outcome"].strip('"').upper()
 
+            import time; time.sleep(1.0)
             r = requests.get(f"{CLOB_BASE}/markets/{condition_id}", timeout=8)
+            if r.status_code == 429:
+                import time; time.sleep(3.0)
+                r = requests.get(f"{CLOB_BASE}/markets/{condition_id}", timeout=8)
             if r.status_code != 200:
                 log.error(f"CLOB markets haku epäonnistui: {r.status_code}")
                 return False
