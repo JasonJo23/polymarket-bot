@@ -275,14 +275,26 @@ class PolymarketFetcher:
 
     def _fetch_market_recent_trades(self, condition_id: str, cutoff_ts: int) -> List[Dict]:
         """Hakee markkinan tuoreet treidit ja palauttaa vain cutoffin jälkeiset."""
-        data = self._get(f"{DATA_BASE}/activity", {
-            "market":        condition_id,
-            "type":          "TRADE",
-            "sortBy":        "TIMESTAMP",
-            "sortDirection": "DESC",
-            "limit":         int(os.getenv("MARKET_ACTIVITY_LIMIT", 100)),
-        })
-        if not data:
+        try:
+            resp = self.session.get(
+                f"{DATA_BASE}/activity",
+                params={
+                    "market":        [condition_id],
+                    "type":          ["TRADE"],
+                    "side":          "BUY",
+                    "start":         cutoff_ts,
+                    "sortBy":        "TIMESTAMP",
+                    "sortDirection": "DESC",
+                    "limit":         int(os.getenv("MARKET_ACTIVITY_LIMIT", 100)),
+                },
+                timeout=8,
+            )
+            if resp.status_code != 200:
+                log.debug(f"Market activity ei saatavilla ({resp.status_code}): {resp.text[:120]}")
+                return []
+            data = resp.json()
+        except requests.exceptions.RequestException as e:
+            log.debug(f"Market activity haku epäonnistui: {e}")
             return []
 
         trades = data if isinstance(data, list) else data.get("data", [])
@@ -351,8 +363,8 @@ class PolymarketFetcher:
             except requests.exceptions.Timeout:
                 log.warning(f"Timeout (yritys {attempt}): {url}")
             except requests.exceptions.HTTPError as e:
-                status = e.response.status_code if e.response else None
-                body   = e.response.text[:150] if e.response else ""
+                status = e.response.status_code if e.response is not None else None
+                body   = e.response.text[:150] if e.response is not None else ""
                 log.warning(f"HTTP {status} (yritys {attempt}): {body}")
                 if status == 429:
                     time.sleep(2 ** attempt * 5)
