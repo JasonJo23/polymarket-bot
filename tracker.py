@@ -30,13 +30,6 @@ from collections import defaultdict
 
 log = logging.getLogger("Scout.Tracker")
 
-# EdgeDetector singleton — yksi instanssi koko sovellukselle
-try:
-    from edge_detector import EdgeDetector as _EdgeDetector
-    _edge_detector_instance = _EdgeDetector()
-except Exception:
-    _edge_detector_instance = None
-
 CLOB_BASE  = "https://clob.polymarket.com"
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 
@@ -403,6 +396,23 @@ class SignalTracker:
                 log.warning(f"Hinta {token_price} äärimmäinen — ohitetaan.")
                 return False
 
+            # Tarkista CLOB:sta onko markkina vielä aktiivinen
+            try:
+                import time as _time
+                _time.sleep(0.5)
+                r_check = requests.get(
+                    f"{CLOB_BASE}/markets-by-token/{token_id}",
+                    timeout=5
+                )
+                if r_check.status_code == 200:
+                    mdata = r_check.json()
+                    if isinstance(mdata, dict):
+                        if not mdata.get("accepting_orders", True):
+                            log.warning(f"Markkina ei enää hyväksy tilauksia — ohitetaan.")
+                            return False
+            except Exception:
+                pass
+
             # Intelligence-tarkistus
             try:
                 from intelligence import analyze_signal
@@ -412,22 +422,6 @@ class SignalTracker:
                     return False
             except Exception as e:
                 log.debug(f"Intelligence epäonnistui: {e}")
-
-            # EdgeDetector — Claude API analysoi edgen
-            try:
-                edge_det = _edge_detector_instance
-                if edge_det is None:
-                    from edge_detector import EdgeDetector
-                    edge_det = EdgeDetector()
-                edge_result = edge_det.should_buy(signal, token_price)
-                if not edge_result["approved"]:
-                    log.info(f"⏭️  EdgeDetector ohitti: {edge_result['reason'][:80]}")
-                    return False
-                signal["_edge"]       = edge_result.get("edge", 0.0)
-                signal["_confidence"] = edge_result.get("confidence", "medium")
-                log.info(f"✅ EdgeDetector hyväksyi: edge={edge_result.get('edge',0):+.2f} conf={edge_result.get('confidence','?')}")
-            except Exception as e:
-                log.debug(f"EdgeDetector epäonnistui — jatketaan ilman: {e}")
 
             # Tick size
             try:
@@ -493,7 +487,7 @@ class SignalTracker:
             log.info(f"✅ Osto tehty: {resp}")
             status = resp.get("status", "") if isinstance(resp, dict) else getattr(resp, "status", "")
 
-            if status == "matched":
+            if status in ("matched", "delayed"):
                 token_amount = round(order_size / exec_price, 4)
                 try:
                     from position_manager import add_position
@@ -506,12 +500,18 @@ class SignalTracker:
                     )
                 except Exception as e:
                     log.debug(f"Position lisäys epäonnistui: {e}")
+                try:
+                    from notifier import notifier
+                    if notifier:
+                        notifier.notify_buy(signal, exec_price, order_size, status)
+                except Exception:
+                    pass
             else:
                 log.info(f"Status: {status} — positiota ei lisätty")
 
             self._executed_today.add(sig_key)
             self._save_executed()
-            signal["_actual_order_size"] = order_size if status == "matched" else 0
+            signal["_actual_order_size"] = order_size if status in ("matched", "delayed") else 0
             return True
 
         except Exception as e:
