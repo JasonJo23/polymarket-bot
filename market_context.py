@@ -15,6 +15,7 @@ analysointiin eikä arvaile.
 =============================================================================
 """
 
+import os
 import re
 import logging
 import requests
@@ -134,17 +135,62 @@ def _fetch_gamma_market(condition_id: str, question: str) -> Optional[Dict]:
         # Fallback: hae kysymyksen perusteella
         r = _session.get(
             f"{GAMMA_BASE}/markets",
-            params={"question": question[:60], "limit": 1, "active": "true"},
+            params={"question": question[:80], "limit": 5, "active": "true"},
             timeout=5
         )
         if r.status_code == 200:
             data = r.json()
             markets = data if isinstance(data, list) else data.get("markets", [])
+            match = _best_question_match(question, markets)
+            if match:
+                return match
             if markets:
-                return markets[0]
+                log.debug(f"Gamma fallback hylätty: ei riittävää osumaa kysymykseen '{question[:80]}'")
 
     except Exception as e:
         log.debug(f"Gamma API haku epäonnistui: {e}")
+    return None
+
+
+def _important_tokens(text: str) -> set:
+    """Palauttaa vertailuun kelpaavat sanat markkinakysymyksestä."""
+    stop_words = {
+        "will", "the", "and", "for", "with", "from", "this", "that",
+        "market", "before", "after", "over", "under", "winner", "game",
+        "match", "series", "round", "may", "jun", "jul", "aug", "sep",
+        "oct", "nov", "dec", "jan", "feb", "mar", "apr", "2026",
+    }
+    normalized = re.sub(r"[^a-z0-9]+", " ", (text or "").lower())
+    return {
+        token
+        for token in normalized.split()
+        if len(token) >= 3 and token not in stop_words and not token.isdigit()
+    }
+
+
+def _question_match_score(source_question: str, candidate_question: str) -> float:
+    """Laskee kuinka hyvin Gamma-tulos vastaa alkuperäistä markkinaa."""
+    source_tokens = _important_tokens(source_question)
+    candidate_tokens = _important_tokens(candidate_question)
+    if not source_tokens or not candidate_tokens:
+        return 0.0
+    return len(source_tokens & candidate_tokens) / max(len(source_tokens), 1)
+
+
+def _best_question_match(question: str, markets: list) -> Optional[Dict]:
+    """Valitsee parhaan Gamma-tuloksen vain jos osuma on riittävän vahva."""
+    best = None
+    best_score = 0.0
+    for market in markets:
+        score = _question_match_score(question, str(market.get("question", "")))
+        if score > best_score:
+            best = market
+            best_score = score
+
+    min_score = float(os.getenv("GAMMA_FALLBACK_MIN_MATCH", "0.55"))
+    if best and best_score >= min_score:
+        return best
+
     return None
 
 
