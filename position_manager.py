@@ -50,6 +50,19 @@ def _is_sports(question: str) -> bool:
     return any(kw in q for kw in SPORTS_KEYWORDS)
 
 
+def _is_esports(question: str) -> bool:
+    q = question.lower()
+    return any(kw in q for kw in [
+        "lol:", "dota", "csgo", "cs2", "valorant", "counter-strike",
+        "lck", "lec", "lpl", "vct", "iem", "pgl", "blast", "dreamleague",
+    ])
+
+
+def _is_esports_map(question: str) -> bool:
+    q = question.lower()
+    return _is_esports(question) and any(kw in q for kw in ["game ", "map "])
+
+
 def _get_current_price(token_id: str) -> Optional[float]:
     try:
         r = requests.get(
@@ -162,11 +175,36 @@ def _evaluate_sports_position(position: Dict) -> Tuple[bool, str]:
     Ei time exittejä, ei TP% laskentaa — pidetään loppuun.
     """
     current_price = float(position.get("current_price", 0.5))
+    profit_lock = float(os.getenv("SPORTS_PROFIT_LOCK_PRICE", 0.92))
+    stop_price = float(os.getenv("SPORTS_STOP_PRICE", 0.10))
 
-    if current_price >= 0.92:
-        return True, f"Urheilu peli voitettu ({current_price:.2f} ≥ 0.92) — lukitaan voitto"
-    if current_price <= 0.10:
-        return True, f"Urheilu peli hävitty ({current_price:.2f} ≤ 0.10) — pelastetaan loput"
+    if current_price >= profit_lock:
+        return True, f"Urheilu voitto lukkoon ({current_price:.2f} >= {profit_lock:.2f})"
+    if current_price <= stop_price:
+        return True, f"Urheilu stop ({current_price:.2f} <= {stop_price:.2f})"
+
+    return False, ""
+
+
+def _evaluate_esports_position(position: Dict) -> Tuple[bool, str]:
+    buy_price = float(position.get("buy_price", 0.5))
+    current_price = float(position.get("current_price", 0.5))
+    hours_left = float(position.get("hours_left", 24))
+    is_map = bool(position.get("is_esports_map", False))
+    pnl_pct = (current_price - buy_price) / buy_price if buy_price > 0 else 0
+
+    profit_lock = float(os.getenv("ESPORTS_PROFIT_LOCK_PRICE", 0.88 if is_map else 0.90))
+    stop_loss = float(os.getenv("ESPORTS_MAP_STOP_LOSS", -0.30 if is_map else -0.35))
+    take_profit = float(os.getenv("ESPORTS_MAP_TAKE_PROFIT", 0.30 if is_map else 0.40))
+
+    if current_price >= profit_lock:
+        return True, f"Esports voitto lukkoon ({current_price:.2f} >= {profit_lock:.2f})"
+    if pnl_pct <= stop_loss:
+        return True, f"Esports SL {stop_loss:.0%} ({pnl_pct:+.1%})"
+    if pnl_pct >= take_profit and hours_left <= 6:
+        return True, f"Esports TP {take_profit:.0%} ({pnl_pct:+.1%}, {hours_left:.1f}h)"
+    if is_map and hours_left <= 1.0 and pnl_pct > 0:
+        return True, f"Esports map time exit voitolla {pnl_pct:+.1%}"
 
     return False, ""
 
@@ -233,9 +271,15 @@ def add_position(signal: Dict, token_id: str, buy_price: float, amount: float, e
         "amount":     amount,
         "end_date":   end_date,
         "is_sports":  _is_sports(signal.get("question", "")),
+        "is_esports": _is_esports(signal.get("question", "")),
+        "is_esports_map": _is_esports_map(signal.get("question", "")),
+        "market_type": signal.get("market_type", ""),
         "bought_at":  datetime.now(timezone.utc).isoformat(),
         "support_count":    signal.get("support_count", 0),
         "weighted_support": signal.get("weighted_support", 0),
+        "positive_roi_support": signal.get("positive_roi_support", 0),
+        "reliable_support": signal.get("reliable_support", 0),
+        "unknown_support": signal.get("unknown_support", 0),
         "total_size_usdc":  signal.get("total_size_usdc", 0),
         "edge":             edge.get("edge", 0.0),
         "our_probability":  edge.get("our_probability", buy_price),
@@ -264,6 +308,7 @@ def check_and_exit_positions():
         buy_price  = float(pos.get("buy_price", 0.5))
         amount     = float(pos.get("amount", 0))
         is_sports  = pos.get("is_sports", False)
+        is_esports = pos.get("is_esports", False) or _is_esports(question)
 
         current_price = _get_current_price(token_id)
         if current_price is None:
@@ -275,10 +320,13 @@ def check_and_exit_positions():
 
         pos["current_price"] = current_price
         pos["hours_left"]    = hours_left
+        pos["is_esports_map"] = pos.get("is_esports_map", False) or _is_esports_map(question)
 
         log.info(f"📊 {question[:35]} | {pnl_pct:+.1%} | {hours_left:.1f}h jäljellä")
 
-        if is_sports:
+        if is_esports:
+            should_sell, reason = _evaluate_esports_position(pos)
+        elif is_sports:
             should_sell, reason = _evaluate_sports_position(pos)
         else:
             should_sell, reason = _evaluate_macro_position(pos)

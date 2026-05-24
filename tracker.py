@@ -81,7 +81,10 @@ class SignalTracker:
         self.smart_threshold = smart_threshold
         self.dry_run         = dry_run
         self.min_signal_size = float(os.getenv("MIN_SIGNAL_SIZE_USDC", 50000))
-        self.max_order_usdc  = float(os.getenv("MAX_ORDER_SIZE_USDC", 5))
+        self.min_order_usdc  = float(os.getenv("MIN_ORDER_SIZE_USDC", 10))
+        self.max_order_usdc  = float(os.getenv("MAX_ORDER_SIZE_USDC", 40))
+        self.min_positive_roi_support = int(os.getenv("MIN_POSITIVE_ROI_SUPPORT", 1))
+        self.unknown_support_override = int(os.getenv("UNKNOWN_SUPPORT_OVERRIDE", 8))
 
         self._executed_file   = "executed_today.json"
         self._executed_today: Set[str] = set()  # Sisältää vain market_id:t (ei outcomea)
@@ -204,7 +207,9 @@ class SignalTracker:
                 market_support[market_id][outcome].append({
                     "wallet":    wallet["address"],
                     "size_usdc": size,
-                    "weight":    wallet.get("wallet_weight", 1.0),  # Suoraan analyzer-tuloksesta
+                    "weight":    wallet.get("wallet_weight", 1.0),
+                    "roi":       wallet.get("wallet_roi", 0.0),
+                    "reliable":  wallet.get("wallet_reliable", False),
                 })
 
         # Hae markkinatiedot rinnakkain
@@ -254,28 +259,45 @@ class SignalTracker:
 
             question = market_info.get("question", market_id[:20])
             end_date = market_info.get("end_date_iso", "")
+            market_type = self._classify_market(question)
 
             for outcome, supporters in outcomes.items():
                 unique_wallets = {s["wallet"] for s in supporters}
                 total_size     = sum(s["size_usdc"] for s in supporters)
 
-                # BUG #3 KORJAUS: Käytä wallet.weight suoraan supporter-listasta
-                # (analyzer on jo liittänyt painon, ei tarvitse hakea scorer-dictistä uudelleen)
-                weighted_support = sum(
-                    s.get("weight", wallet_scores.get(s["wallet"], {}).get("weight", 1.0))
-                    for s in supporters
-                    if s["wallet"] in unique_wallets
+                by_wallet = {}
+                for s in supporters:
+                    addr = s["wallet"]
+                    if addr not in by_wallet or s["size_usdc"] > by_wallet[addr]["size_usdc"]:
+                        by_wallet[addr] = s
+
+                weighted_support = sum(s.get("weight", 1.0) for s in by_wallet.values())
+                positive_roi_support = sum(
+                    1 for s in by_wallet.values()
+                    if s.get("reliable", False) and s.get("roi", 0.0) > 0
                 )
+                reliable_support = sum(1 for s in by_wallet.values() if s.get("reliable", False))
+                unknown_support = len(unique_wallets) - reliable_support
 
                 if (len(unique_wallets) >= self.smart_threshold and
-                        total_size >= self.min_signal_size):
+                        total_size >= self.min_signal_size and
+                        self._passes_wallet_quality(
+                            market_type=market_type,
+                            support_count=len(unique_wallets),
+                            weighted_support=weighted_support,
+                            positive_roi_support=positive_roi_support,
+                        )):
                     signals.append({
                         "market_id":        market_id,
                         "question":         question,
                         "end_date":         end_date if end_date else "?",
                         "outcome":          outcome,
+                        "market_type":      market_type,
                         "support_count":    len(unique_wallets),
                         "weighted_support": round(weighted_support, 2),
+                        "positive_roi_support": positive_roi_support,
+                        "reliable_support": reliable_support,
+                        "unknown_support": unknown_support,
                         "supporters":       list(unique_wallets),
                         "total_size_usdc":  total_size,
                         "timestamp":        datetime.now(timezone.utc).isoformat(),
@@ -391,6 +413,7 @@ class SignalTracker:
 
             signal["token_id"] = token_id
             signal["token_price"] = token_price
+            signal["market_type"] = signal.get("market_type") or self._classify_market(signal.get("question", ""))
 
             # Tarkista CLOB:sta onko markkina vielä aktiivinen
             try:
@@ -439,6 +462,11 @@ class SignalTracker:
                 else:
                     log.warning(f"EdgeDetector epäonnistui — ohitetaan signaali: {e}")
                     return False
+
+            price_check = self._passes_price_rules(signal["market_type"], token_price, signal.get("edge", {}))
+            if not price_check["approved"]:
+                log.warning(f"Riskisäännöt hylkäsivät edgen jälkeen: {price_check['reason']}")
+                return False
 
             order_size = self._calculate_order_size(signal)
 
@@ -568,11 +596,17 @@ class SignalTracker:
     # ------------------------------------------------------------------
 
     def _calculate_order_size(self, signal: Dict[str, Any]) -> float:
-        """Skaalaa panos konsensuksen, edgen ja confidence-tason mukaan."""
-        base_size = min(self.max_order_usdc, signal["total_size_usdc"] * 0.01)
+        """Skaalaa panos markkinatyypin, edgen ja confidence-tason mukaan."""
         edge_info = signal.get("edge") or {}
         edge = max(0.0, float(edge_info.get("edge", 0.0) or 0.0))
         confidence = str(edge_info.get("confidence", "medium")).lower()
+        market_type = signal.get("market_type") or self._classify_market(signal.get("question", ""))
+
+        confidence_base = {
+            "high": float(os.getenv("ORDER_SIZE_HIGH_CONFIDENCE", 40)),
+            "medium": float(os.getenv("ORDER_SIZE_MEDIUM_CONFIDENCE", 20)),
+            "low": float(os.getenv("ORDER_SIZE_LOW_CONFIDENCE", 10)),
+        }.get(confidence, float(os.getenv("ORDER_SIZE_MEDIUM_CONFIDENCE", 20)))
 
         edge_multiplier = 1.0
         if edge >= 0.20:
@@ -582,17 +616,113 @@ class SignalTracker:
         elif edge >= 0.10:
             edge_multiplier = 1.15
 
-        confidence_multiplier = {
-            "high": 1.25,
-            "medium": 1.0,
-            "low": 0.65,
-        }.get(confidence, 1.0)
+        market_multiplier = {
+            "macro": float(os.getenv("MACRO_ORDER_MULTIPLIER", 1.0)),
+            "sports": float(os.getenv("SPORTS_ORDER_MULTIPLIER", 1.0)),
+            "esports_match": float(os.getenv("ESPORTS_MATCH_ORDER_MULTIPLIER", 0.75)),
+            "esports_map": float(os.getenv("ESPORTS_MAP_ORDER_MULTIPLIER", 0.5)),
+            "general": float(os.getenv("GENERAL_ORDER_MULTIPLIER", 0.8)),
+        }.get(market_type, 0.8)
 
         weighted_support = float(signal.get("weighted_support", 1.0) or 1.0)
         support_multiplier = min(1.3, max(0.8, weighted_support / max(self.smart_threshold, 1)))
 
-        size = base_size * edge_multiplier * confidence_multiplier * support_multiplier
-        return max(round(min(size, self.max_order_usdc), 2), 1.0)
+        size = confidence_base * edge_multiplier * market_multiplier * support_multiplier
+        market_cap = self._market_order_cap(market_type)
+        return max(round(min(size, self.max_order_usdc, market_cap), 2), self.min_order_usdc)
+
+    def _classify_market(self, question: str) -> str:
+        q = question.lower()
+        esports = any(k in q for k in [
+            "lol:", "dota", "cs2", "csgo", "counter-strike", "valorant",
+            "lck", "lec", "lpl", "vct", "iem", "pgl", "blast", "dreamleague",
+        ])
+        if esports:
+            if any(k in q for k in ["game ", "map "]):
+                return "esports_map"
+            return "esports_match"
+        if any(k in q for k in [
+            "vs.", "vs ", "winner", "match", "series", "spread", "o/u",
+            "nba", "nfl", "nhl", "mlb", "atp", "wta", "ufc", "fc ",
+        ]):
+            return "sports"
+        if any(k in q for k in [
+            "iran", "trump", "biden", "election", "fed", "btc", "eth",
+            "bitcoin", "ethereum", "tariff", "ceasefire", "invade",
+            "uranium", "peace deal",
+        ]):
+            return "macro"
+        return "general"
+
+    def _price_bounds(self, market_type: str) -> tuple:
+        bounds = {
+            "macro": (
+                float(os.getenv("MACRO_MIN_TOKEN_PRICE", 0.20)),
+                float(os.getenv("MACRO_MAX_TOKEN_PRICE", 0.85)),
+            ),
+            "sports": (
+                float(os.getenv("SPORTS_MIN_TOKEN_PRICE", 0.25)),
+                float(os.getenv("SPORTS_MAX_TOKEN_PRICE", 0.85)),
+            ),
+            "esports_match": (
+                float(os.getenv("ESPORTS_MATCH_MIN_TOKEN_PRICE", 0.30)),
+                float(os.getenv("ESPORTS_MATCH_MAX_TOKEN_PRICE", 0.78)),
+            ),
+            "esports_map": (
+                float(os.getenv("ESPORTS_MAP_MIN_TOKEN_PRICE", 0.35)),
+                float(os.getenv("ESPORTS_MAP_MAX_TOKEN_PRICE", 0.70)),
+            ),
+            "general": (
+                float(os.getenv("GENERAL_MIN_TOKEN_PRICE", 0.25)),
+                float(os.getenv("GENERAL_MAX_TOKEN_PRICE", 0.80)),
+            ),
+        }
+        return bounds.get(market_type, bounds["general"])
+
+    def _market_order_cap(self, market_type: str) -> float:
+        caps = {
+            "macro": float(os.getenv("MACRO_MAX_ORDER_SIZE_USDC", self.max_order_usdc)),
+            "sports": float(os.getenv("SPORTS_MAX_ORDER_SIZE_USDC", self.max_order_usdc)),
+            "esports_match": float(os.getenv("ESPORTS_MATCH_MAX_ORDER_SIZE_USDC", 25)),
+            "esports_map": float(os.getenv("ESPORTS_MAP_MAX_ORDER_SIZE_USDC", 15)),
+            "general": float(os.getenv("GENERAL_MAX_ORDER_SIZE_USDC", 20)),
+        }
+        return caps.get(market_type, caps["general"])
+
+    def _passes_price_rules(self, market_type: str, token_price: float, edge_info: Dict[str, Any]) -> Dict[str, Any]:
+        low, high = self._price_bounds(market_type)
+        edge = float(edge_info.get("edge", 0.0) or 0.0)
+        confidence = str(edge_info.get("confidence", "low")).lower()
+
+        if confidence == "high" and edge >= 0.15 and market_type in ("macro", "sports", "esports_match"):
+            low = max(0.05, low - 0.05)
+            high = min(0.90, high + 0.05)
+
+        if token_price < low:
+            return {"approved": False, "reason": f"{market_type} hinta liian matala {token_price:.3f} < {low:.2f}"}
+        if token_price > high:
+            return {"approved": False, "reason": f"{market_type} hinta liian korkea {token_price:.3f} > {high:.2f}"}
+        return {"approved": True, "reason": "OK"}
+
+    def _passes_wallet_quality(
+        self,
+        market_type: str,
+        support_count: int,
+        weighted_support: float,
+        positive_roi_support: int,
+    ) -> bool:
+        if positive_roi_support >= self.min_positive_roi_support:
+            pass
+        elif support_count < self.unknown_support_override:
+            return False
+
+        if market_type == "esports_map":
+            min_support = int(os.getenv("ESPORTS_MAP_MIN_SUPPORT", max(self.smart_threshold + 2, 6)))
+            return support_count >= min_support and weighted_support >= min_support * 0.8
+        if market_type == "esports_match":
+            min_support = int(os.getenv("ESPORTS_MATCH_MIN_SUPPORT", max(self.smart_threshold + 1, 5)))
+            return support_count >= min_support and weighted_support >= min_support * 0.75
+        return True
 
     def _get_market_info_clob(self, condition_id: str) -> Optional[Dict]:
         if condition_id in self._market_cache:

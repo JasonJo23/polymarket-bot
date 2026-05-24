@@ -36,7 +36,7 @@ class EdgeDetector:
         self.min_edge         = float(os.getenv("MIN_EDGE_THRESHOLD", 0.08))
         self.min_data_quality = float(os.getenv("MIN_DATA_QUALITY", 0.3))
         self.min_token_price  = float(os.getenv("MIN_TOKEN_PRICE", 0.25))
-        self.max_token_price  = float(os.getenv("MAX_TOKEN_PRICE", 0.80))
+        self.max_token_price  = float(os.getenv("MAX_TOKEN_PRICE", 0.85))
         self.enabled          = os.getenv("EDGE_DETECTOR_ENABLED", "true").lower() == "true"
 
         # BUG #1 KORJAUS: analyysicache per sykli
@@ -78,10 +78,12 @@ class EdgeDetector:
             return self._approve("EdgeDetector ei käytössä")
 
         # Hintatarkistus
-        if token_price < self.min_token_price:
-            return self._reject(f"Hinta liian matala ({token_price:.3f} < {self.min_token_price})")
-        if token_price > self.max_token_price:
-            return self._reject(f"Hinta liian korkea ({token_price:.3f} > {self.max_token_price})")
+        market_type = signal.get("market_type") or self._detect_sport(question)
+        low, high = self._price_bounds(market_type, relaxed=True)
+        if token_price < low:
+            return self._reject(f"{market_type} hinta liian matala ({token_price:.3f} < {low:.2f})")
+        if token_price > high:
+            return self._reject(f"{market_type} hinta liian korkea ({token_price:.3f} > {high:.2f})")
 
         # BUG #1 KORJAUS: tarkista cache ensin
         cache_key = f"{question}|{outcome}"
@@ -152,6 +154,11 @@ class EdgeDetector:
             (edge >= 0.20)
         )
 
+        if confidence == "high" and edge >= 0.15:
+            relaxed_low, relaxed_high = self._price_bounds(market_type, relaxed=True)
+            if relaxed_low <= token_price <= relaxed_high:
+                should_bet = True
+
         if should_bet:
             reason = (
                 f"Edge löytyi! oma={our_prob:.2f} poly={token_price:.2f} "
@@ -186,14 +193,44 @@ class EdgeDetector:
     def _detect_sport(self, question: str) -> str:
         q = question.lower()
         if any(k in q for k in ["lol:", "cs2", "csgo", "valorant", "dota", "esports", "lck", "lec", "counter-strike"]):
-            return "esports"
+            if any(k in q for k in ["game ", "map "]):
+                return "esports_map"
+            return "esports_match"
         if any(k in q for k in ["lakers", "celtics", "knicks", "nba", "thunder", "spurs", "76ers", "cavaliers", "pistons", "timberwolves"]):
-            return "nba"
+            return "sports"
         if any(k in q for k in ["fc ", "arsenal", "chelsea", "liverpool", "madrid", "barcelona", "premier league", "la liga"]):
-            return "football"
+            return "sports"
         if any(k in q for k in ["trump", "biden", "iran", "election", "fed", "btc", "eth", "tariff", "ceasefire"]):
-            return "politics/macro"
+            return "macro"
         return "general"
+
+    def _price_bounds(self, market_type: str, relaxed: bool = False) -> tuple:
+        bounds = {
+            "macro": (
+                float(os.getenv("MACRO_MIN_TOKEN_PRICE", 0.20)),
+                float(os.getenv("MACRO_MAX_TOKEN_PRICE", 0.85)),
+            ),
+            "sports": (
+                float(os.getenv("SPORTS_MIN_TOKEN_PRICE", 0.25)),
+                float(os.getenv("SPORTS_MAX_TOKEN_PRICE", 0.85)),
+            ),
+            "esports_match": (
+                float(os.getenv("ESPORTS_MATCH_MIN_TOKEN_PRICE", 0.30)),
+                float(os.getenv("ESPORTS_MATCH_MAX_TOKEN_PRICE", 0.78)),
+            ),
+            "esports_map": (
+                float(os.getenv("ESPORTS_MAP_MIN_TOKEN_PRICE", 0.35)),
+                float(os.getenv("ESPORTS_MAP_MAX_TOKEN_PRICE", 0.70)),
+            ),
+            "general": (
+                self.min_token_price,
+                self.max_token_price,
+            ),
+        }
+        low, high = bounds.get(market_type, bounds["general"])
+        if relaxed and market_type in ("macro", "sports", "esports_match"):
+            return max(0.05, low - 0.05), min(0.90, high + 0.05)
+        return low, high
 
     def _approve(self, reason: str, edge: float = 0.0, our_probability: float = 0.5, confidence: str = "medium") -> Dict:
         return {"approved": True, "reason": reason, "edge": edge, "our_probability": our_probability, "confidence": confidence}
