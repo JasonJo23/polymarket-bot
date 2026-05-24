@@ -143,6 +143,12 @@ class EdgeDetector:
         confidence = result.get("confidence", "low")
         reasoning  = result.get("reasoning", "")
 
+        if self._reasoning_flags_bad_context(reasoning):
+            final = self._reject(f"Claude havaitsi virheellisen kontekstin: {reasoning[:100]}")
+            self._analysis_cache[cache_key] = final
+            log.warning(f"EdgeDetector hylkäsi virhekontekstin: {question[:40]} → {reasoning[:120]}")
+            return final
+
         # BUG #2+#3 KORJAUS: parannettu päätöslogiikka
         # Osta jos:
         #   - edge >= min_edge (0.08) JA confidence != "low"
@@ -231,6 +237,23 @@ class EdgeDetector:
         if relaxed and market_type in ("macro", "sports", "esports_match"):
             return max(0.05, low - 0.05), min(0.90, high + 0.05)
         return low, high
+
+    def _reasoning_flags_bad_context(self, reasoning: str) -> bool:
+        text = (reasoning or "").lower()
+        bad_context_phrases = [
+            "konteksti virheellinen",
+            "markkinakuvaus virheellinen",
+            "kuvaus virheellinen",
+            "ei vastaa markkinaa",
+            "ei vastaa otsikkoa",
+            "wrong context",
+            "context mismatch",
+            "description mismatch",
+            "rihanna",
+            "gta",
+            "gta vi",
+        ]
+        return any(phrase in text for phrase in bad_context_phrases)
 
     def _approve(self, reason: str, edge: float = 0.0, our_probability: float = 0.5, confidence: str = "medium") -> Dict:
         return {"approved": True, "reason": reason, "edge": edge, "our_probability": our_probability, "confidence": confidence}

@@ -28,9 +28,12 @@ log = logging.getLogger("Scout.WalletScorer")
 CLOB_BASE   = "https://clob.polymarket.com"
 GAMMA_BASE  = "https://gamma-api.polymarket.com"
 _CACHE_FILE = "market_cache.json"
+_SCORE_CACHE_FILE = "wallet_score_cache.json"
 
 _market_result_cache: Dict[str, Optional[str]] = {}
 _cache_loaded = False
+_wallet_score_cache: Dict[str, Dict] = {}
+_score_cache_loaded = False
 
 
 def _load_cache_from_disk():
@@ -76,6 +79,46 @@ def _get_winning_outcome(condition_id: str) -> Optional[str]:
 def _batch_save_cache():
     """Tallentaa cachen levylle kerran kaikkien lompakkojen jälkeen."""
     _save_cache_to_disk()
+
+
+def _load_score_cache_from_disk():
+    global _score_cache_loaded
+    if _score_cache_loaded:
+        return
+    _score_cache_loaded = True
+    try:
+        with open(_SCORE_CACHE_FILE, "r") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            _wallet_score_cache.update(data)
+        log.info(f"Wallet score cache ladattu: {len(_wallet_score_cache)} lompakkoa")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.debug(f"Wallet score cache lataus epäonnistui: {e}")
+
+
+def _save_score_cache_to_disk():
+    try:
+        with open(_SCORE_CACHE_FILE, "w") as f:
+            json.dump(_wallet_score_cache, f)
+    except Exception as e:
+        log.debug(f"Wallet score cache tallennus epäonnistui: {e}")
+
+
+def _history_fingerprint(trade_history: List[Dict]) -> Dict:
+    latest = ""
+    for trade in trade_history:
+        ts = _parse_timestamp(trade)
+        if ts is None:
+            continue
+        iso = ts.isoformat()
+        if iso > latest:
+            latest = iso
+    return {
+        "count": len(trade_history),
+        "latest": latest,
+    }
 
 
 def _try_clob(condition_id: str) -> Optional[str]:
@@ -435,15 +478,27 @@ def score_wallets_batch(
     history_cache:     Dict[str, List[Dict]]
 ) -> Dict[str, Dict]:
     _load_cache_from_disk()
+    _load_score_cache_from_disk()
     scores = {}
     high_scores = []
     low_scores  = []
-    mm_total = no_data = 0
+    mm_total = no_data = cache_hits = 0
 
     for wallet in qualified_wallets:
         addr    = wallet["address"]
         history = history_cache.get(addr.lower(), [])
-        score   = calculate_wallet_score(addr, history)
+        fingerprint = _history_fingerprint(history)
+        cached = _wallet_score_cache.get(addr.lower())
+        if cached and cached.get("fingerprint") == fingerprint:
+            score = cached.get("score", {})
+            cache_hits += 1
+        else:
+            score = calculate_wallet_score(addr, history)
+            _wallet_score_cache[addr.lower()] = {
+                "fingerprint": fingerprint,
+                "score": score,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
         scores[addr] = score
         mm_total += score.get("mm_skipped", 0)
         if not score["reliable"]:
@@ -455,8 +510,9 @@ def score_wallets_batch(
 
     # Tallenna cache kerran kaikkien lompakkojen jälkeen
     _batch_save_cache()
+    _save_score_cache_to_disk()
 
-    log.info(f"Wallet scoring valmis: {len(high_scores)} korkea | {len(low_scores)} matala | {no_data} ei dataa | {mm_total} MM-kauppaa suodatettu")
+    log.info(f"Wallet scoring valmis: {len(high_scores)} korkea | {len(low_scores)} matala | {no_data} ei dataa | {mm_total} MM-kauppaa suodatettu | cache hit {cache_hits}")
     if high_scores:
         log.info(f"🌟 TOP lompakot: {' | '.join(high_scores[:5])}")
     if low_scores:

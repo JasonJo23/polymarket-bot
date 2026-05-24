@@ -552,12 +552,13 @@ class SignalTracker:
                 )
             else:
                 exec_price = round(token_price, 3)
-                log.info(f"GTC makro: {exec_price} | {order_size} USDC")
+                token_size = round(order_size / exec_price, 6)
+                log.info(f"GTC makro: {exec_price} | {order_size} USDC | {token_size} tokenia")
                 resp = client.create_and_post_order(
                     order_args=OrderArgs(
                         token_id=token_id,
                         price=exec_price,
-                        size=order_size,
+                        size=token_size,
                         side=Side.BUY,
                     ),
                     options=options,
@@ -570,9 +571,10 @@ class SignalTracker:
 
             log.info(f"✅ Osto tehty: {resp}")
             status = resp.get("status", "") if isinstance(resp, dict) else getattr(resp, "status", "")
+            filled_usdc, filled_tokens = self._extract_fill_amounts(resp, order_size, exec_price)
 
             if status in ("matched", "delayed"):
-                token_amount = round(order_size / exec_price, 4)
+                token_amount = round(filled_tokens, 4)
                 try:
                     from position_manager import add_position
                     add_position(
@@ -595,7 +597,7 @@ class SignalTracker:
 
             self._executed_today.add(sig_key)
             self._save_executed()
-            signal["_actual_order_size"] = order_size if status in ("matched", "delayed") else 0
+            signal["_actual_order_size"] = filled_usdc if status in ("matched", "delayed") else 0
             return True
 
         except Exception as e:
@@ -645,6 +647,26 @@ class SignalTracker:
         size = confidence_base * edge_multiplier * market_multiplier * support_multiplier
         market_cap = self._market_order_cap(market_type)
         return max(round(min(size, self.max_order_usdc, market_cap), 2), self.min_order_usdc)
+
+    def _extract_fill_amounts(self, resp: Any, fallback_usdc: float, price: float) -> tuple:
+        """Palauttaa toteutuneen USDC- ja token-määrän CLOB-responsesta."""
+        if not isinstance(resp, dict):
+            tokens = fallback_usdc / price if price > 0 else 0.0
+            return fallback_usdc, tokens
+
+        def _num(key: str) -> float:
+            try:
+                return float(resp.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        making = _num("makingAmount")
+        taking = _num("takingAmount")
+        if making > 0 and taking > 0:
+            return making, taking
+
+        tokens = fallback_usdc / price if price > 0 else 0.0
+        return fallback_usdc, tokens
 
     def _classify_market(self, question: str) -> str:
         q = question.lower()

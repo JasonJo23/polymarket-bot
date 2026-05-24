@@ -130,7 +130,10 @@ def _fetch_gamma_market(condition_id: str, question: str) -> Optional[Dict]:
                 data = r.json()
                 markets = data if isinstance(data, list) else data.get("markets", [])
                 if markets:
-                    return markets[0]
+                    match = _best_question_match(question, markets, min_score=0.35)
+                    if match:
+                        return match
+                    log.debug(f"Gamma condition_id hylätty: ei vastaa kysymystä '{question[:80]}'")
 
         # Fallback: hae kysymyksen perusteella
         r = _session.get(
@@ -177,17 +180,23 @@ def _question_match_score(source_question: str, candidate_question: str) -> floa
     return len(source_tokens & candidate_tokens) / max(len(source_tokens), 1)
 
 
-def _best_question_match(question: str, markets: list) -> Optional[Dict]:
+def _best_question_match(question: str, markets: list, min_score: float = None) -> Optional[Dict]:
     """Valitsee parhaan Gamma-tuloksen vain jos osuma on riittävän vahva."""
     best = None
     best_score = 0.0
     for market in markets:
-        score = _question_match_score(question, str(market.get("question", "")))
+        candidate_text = " ".join([
+            str(market.get("question", "")),
+            str(market.get("title", "")),
+            str(market.get("slug", "")),
+        ])
+        score = _question_match_score(question, candidate_text)
         if score > best_score:
             best = market
             best_score = score
 
-    min_score = float(os.getenv("GAMMA_FALLBACK_MIN_MATCH", "0.55"))
+    if min_score is None:
+        min_score = float(os.getenv("GAMMA_FALLBACK_MIN_MATCH", "0.55"))
     if best and best_score >= min_score:
         return best
 

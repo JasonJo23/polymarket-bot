@@ -124,6 +124,18 @@ def _sell_position_v2(
             funder=os.getenv("PROXY_WALLET_ADDRESS")
         )
 
+        actual_balance = _get_token_balance_v2(client, token_id)
+        if actual_balance is not None:
+            if actual_balance <= 0.0001:
+                log.warning(f"Positio puuttuu walletista — poistetaan seurannasta: {token_id[:16]}")
+                return True
+            if actual_balance < amount:
+                log.warning(
+                    f"Paikallinen positio suurempi kuin wallet-saldo: "
+                    f"{amount:.4f} → {actual_balance:.4f}"
+                )
+                amount = actual_balance
+
         # Hae tick size
         tick_size = "0.01"
         try:
@@ -164,6 +176,30 @@ def _sell_position_v2(
         else:
             log.error(f"Myyntivirhe: {e}")
         return False
+
+
+def _get_token_balance_v2(client, token_id: str) -> Optional[float]:
+    """Hakee todellisen conditional-token saldon ennen myyntiä."""
+    try:
+        headers = client._create_l2_headers("GET", "/balance-allowance", None)
+        r = requests.get(
+            f"{CLOB_BASE}/balance-allowance",
+            headers=headers,
+            params={
+                "asset_type": "CONDITIONAL",
+                "token_id": token_id,
+                "signature_type": 2,
+            },
+            timeout=8,
+        )
+        if r.status_code != 200:
+            log.debug(f"Token-saldon haku epäonnistui: {r.status_code} {r.text[:120]}")
+            return None
+        raw = r.json().get("balance", 0)
+        return float(raw) / 1e6
+    except Exception as e:
+        log.debug(f"Token-saldon haku epäonnistui: {e}")
+        return None
 
 
 def _evaluate_sports_position(position: Dict) -> Tuple[bool, str]:

@@ -4,8 +4,7 @@ Luo Polymarket CLOB API -avaimet MetaMask private keyllä.
 Aja kerran — tallentaa avaimet .env-tiedostoon automaattisesti.
 """
 
-from py_clob_client.client import ClobClient
-from py_clob_client.constants import POLYGON
+from py_clob_client_v2 import ClobClient
 
 # ----------------------------------------------------------------
 # TÄYTÄ TÄHÄN oma private key (0x-alkuinen)
@@ -21,7 +20,8 @@ def main():
     client = ClobClient(
         host="https://clob.polymarket.com",
         key=PRIVATE_KEY,
-        chain_id=POLYGON
+        chain_id=137,
+        signature_type=2,
     )
 
     print("Luodaan API-avaimet...")

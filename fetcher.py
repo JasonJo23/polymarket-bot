@@ -71,8 +71,12 @@ class PolymarketFetcher:
         # Vaihe 1: Pian sulkeutuvat markkinat
         markets = self._fetch_closing_soon_markets()
         if not markets:
-            log.warning("Ei sopivia markkinoita – kokeillaan top-volyymi ilman aikarajoitusta.")
-            markets = self._fetch_top_markets_fallback()
+            if os.getenv("ALLOW_TOP_MARKETS_FALLBACK", "false").lower() == "true":
+                log.warning("Ei sopivia markkinoita – kokeillaan top-volyymi ilman aikarajoitusta.")
+                markets = self._fetch_top_markets_fallback()
+            else:
+                log.warning("Ei sopivia closing-soon markkinoita – sykli ohitetaan.")
+                return []
 
         if not markets:
             log.error("Ei markkinoita saatu.")
