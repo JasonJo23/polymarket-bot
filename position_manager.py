@@ -278,6 +278,8 @@ def add_position(signal: Dict, token_id: str, buy_price: float, amount: float, e
         "support_count":    signal.get("support_count", 0),
         "weighted_support": signal.get("weighted_support", 0),
         "positive_roi_support": signal.get("positive_roi_support", 0),
+        "category_positive_support": signal.get("category_positive_support", 0),
+        "active_support": signal.get("active_support", 0),
         "reliable_support": signal.get("reliable_support", 0),
         "unknown_support": signal.get("unknown_support", 0),
         "total_size_usdc":  signal.get("total_size_usdc", 0),

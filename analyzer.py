@@ -76,6 +76,10 @@ class WalletAnalyzer:
             metrics["wallet_win_rate"] = score.get("win_rate",     0.5)
             metrics["wallet_reliable"] = score.get("reliable",     False)
             metrics["resolved_count"]  = score.get("resolved_count", 0)
+            metrics["category_weights"] = score.get("category_weights", {})
+            metrics["trades_7d"] = score.get("trades_7d", 0)
+            metrics["trades_14d"] = score.get("trades_14d", 0)
+            metrics["active_recently"] = score.get("active_recently", False)
 
             if not self._passes_base_filter(metrics):
                 continue
@@ -144,6 +148,10 @@ class WalletAnalyzer:
             "wallet_win_rate":   0.5,
             "wallet_reliable":   False,
             "resolved_count":    0,
+            "category_weights":   {},
+            "trades_7d":          0,
+            "trades_14d":         0,
+            "active_recently":    False,
         }
 
     def _passes_base_filter(self, m: Dict) -> bool:

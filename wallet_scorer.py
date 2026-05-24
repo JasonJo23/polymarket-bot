@@ -19,6 +19,7 @@ import os
 import json
 import logging
 import requests
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 
@@ -178,6 +179,21 @@ def _group_trades_by_market(trade_history: List[Dict]) -> Dict[str, Dict[str, fl
     return market_positions
 
 
+def _market_categories(trade_history: List[Dict]) -> Dict[str, str]:
+    categories = {}
+    for trade in trade_history:
+        condition_id = (
+            trade.get("conditionId") or
+            trade.get("condition_id") or
+            trade.get("market") or ""
+        )
+        condition_id = str(condition_id).strip()
+        if not condition_id or condition_id in categories:
+            continue
+        categories[condition_id] = _classify_market_text(_trade_market_text(trade))
+    return categories
+
+
 def _calculate_market_roi(outcome_sizes: Dict[str, float], winning_outcome: str) -> Tuple[float, float, float]:
     total_usdc   = sum(outcome_sizes.values())
     winning_usdc = outcome_sizes.get(winning_outcome, 0.0)
@@ -199,11 +215,112 @@ def _roi_to_weight(weighted_roi: float) -> float:
         return 0.4
 
 
+def _classify_market_text(text: str) -> str:
+    q = (text or "").lower()
+    esports = any(k in q for k in [
+        "lol:", "dota", "cs2", "csgo", "counter-strike", "valorant",
+        "lck", "lec", "lpl", "vct", "iem", "pgl", "blast", "dreamleague",
+    ])
+    if esports:
+        if any(k in q for k in ["game ", "map "]):
+            return "esports_map"
+        return "esports_match"
+    if any(k in q for k in [
+        "vs.", "vs ", "winner", "match", "series", "spread", "o/u",
+        "nba", "nfl", "nhl", "mlb", "atp", "wta", "ufc", "fc ",
+    ]):
+        return "sports"
+    if any(k in q for k in [
+        "iran", "trump", "biden", "election", "fed", "btc", "eth",
+        "bitcoin", "ethereum", "tariff", "ceasefire", "invade",
+        "uranium", "peace deal",
+    ]):
+        return "macro"
+    return "general"
+
+
+def _trade_market_text(trade: Dict) -> str:
+    for key in ("title", "question", "marketName", "market_name", "slug"):
+        value = trade.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _parse_timestamp(trade: Dict) -> Optional[datetime]:
+    raw = trade.get("timestamp")
+    if raw is None:
+        return None
+    try:
+        if isinstance(raw, (int, float)):
+            ts = raw / 1000 if raw > 1e10 else raw
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        if isinstance(raw, str):
+            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (ValueError, OSError):
+        pass
+    return None
+
+
+def _activity_stats(trade_history: List[Dict]) -> Dict:
+    now = datetime.now(timezone.utc)
+    cutoff_7d = now - timedelta(days=7)
+    cutoff_14d = now - timedelta(days=14)
+    trades_7d = trades_14d = 0
+    for trade in trade_history:
+        ts = _parse_timestamp(trade)
+        if ts is None:
+            continue
+        if ts >= cutoff_14d:
+            trades_14d += 1
+        if ts >= cutoff_7d:
+            trades_7d += 1
+    return {
+        "trades_7d": trades_7d,
+        "trades_14d": trades_14d,
+        "active_recently": trades_14d >= int(os.getenv("MIN_TRADES_14D_FOR_ACTIVE", 5)),
+    }
+
+
+def _category_weights(category_stats: Dict[str, Dict]) -> Dict[str, Dict]:
+    result = {}
+    for category in ("macro", "sports", "esports_match", "esports_map", "general"):
+        stats = category_stats.get(category, {})
+        total_usdc = float(stats.get("total_usdc", 0.0))
+        checked = int(stats.get("checked", 0))
+        correct = int(stats.get("correct", 0))
+        weighted_roi_sum = float(stats.get("weighted_roi_sum", 0.0))
+        reliable = checked >= int(os.getenv("MIN_CATEGORY_RESOLVED", 3))
+        weighted_roi = weighted_roi_sum / total_usdc if total_usdc > 0 else 0.0
+        weight = _roi_to_weight(weighted_roi) if reliable else float(os.getenv("UNKNOWN_CATEGORY_WEIGHT", 0.7))
+        result[category] = {
+            "weight": round(weight, 3),
+            "weighted_roi": round(weighted_roi, 4),
+            "resolved_count": checked,
+            "win_rate": round(correct / checked, 3) if checked else 0.5,
+            "reliable": reliable,
+        }
+    return result
+
+
 def _default_score(address: str, checked: int = 0, correct: int = 0) -> Dict:
+    unknown_weight = float(os.getenv("UNKNOWN_WALLET_WEIGHT", 0.7))
+    category_weights = {
+        category: {
+            "weight": unknown_weight,
+            "weighted_roi": 0.0,
+            "resolved_count": 0,
+            "win_rate": 0.5,
+            "reliable": False,
+        }
+        for category in ("macro", "sports", "esports_match", "esports_map", "general")
+    }
     return {
         "address": address, "win_rate": 0.5, "avg_roi": 0.0,
         "weighted_roi": 0.0, "resolved_count": checked, "correct_count": correct,
-        "total_usdc": 0.0, "weight": 1.0, "reliable": False, "mm_skipped": 0,
+        "total_usdc": 0.0, "weight": unknown_weight, "reliable": False, "mm_skipped": 0,
+        "category_weights": category_weights,
+        **_activity_stats([]),
     }
 
 
@@ -243,8 +360,12 @@ def calculate_wallet_score(
 ) -> Dict:
     _load_cache_from_disk()
     market_positions = _group_trades_by_market(trade_history)
+    activity = _activity_stats(trade_history)
     if not market_positions:
-        return _default_score(wallet_address)
+        score = _default_score(wallet_address)
+        score.update(activity)
+        return score
+    market_categories = _market_categories(trade_history)
 
     # Prefetch kaikki puuttuvat tulokset rinnakkain
     all_cids = [cid for cid, sizes in list(market_positions.items())[:max_markets]
@@ -253,6 +374,12 @@ def calculate_wallet_score(
 
     correct = checked = mm_skipped = 0
     total_roi_sum = weighted_roi_sum = total_usdc_checked = 0.0
+    category_stats: Dict[str, Dict] = defaultdict(lambda: {
+        "checked": 0,
+        "correct": 0,
+        "total_usdc": 0.0,
+        "weighted_roi_sum": 0.0,
+    })
 
     for condition_id, outcome_sizes in list(market_positions.items())[:max_markets]:
         if _is_market_maker(outcome_sizes):
@@ -268,12 +395,24 @@ def calculate_wallet_score(
         total_usdc_checked += total_usdc
         if roi > 0:
             correct += 1
+        category = market_categories.get(condition_id, "general")
+        category_stats[category]["checked"] += 1
+        category_stats[category]["total_usdc"] += total_usdc
+        category_stats[category]["weighted_roi_sum"] += roi * total_usdc
+        if roi > 0:
+            category_stats[category]["correct"] += 1
 
     if checked < min_resolved:
-        return _default_score(wallet_address, checked, correct)
+        score = _default_score(wallet_address, checked, correct)
+        score.update(activity)
+        score["category_weights"] = _category_weights(category_stats)
+        return score
 
     avg_roi      = total_roi_sum / checked
     weighted_roi = weighted_roi_sum / total_usdc_checked if total_usdc_checked > 0 else 0.0
+    overall_weight = _roi_to_weight(weighted_roi)
+    if not activity["active_recently"]:
+        overall_weight = min(overall_weight, float(os.getenv("INACTIVE_WALLET_MAX_WEIGHT", 0.8)))
 
     return {
         "address":        wallet_address,
@@ -283,9 +422,11 @@ def calculate_wallet_score(
         "resolved_count": checked,
         "correct_count":  correct,
         "total_usdc":     round(total_usdc_checked, 2),
-        "weight":         _roi_to_weight(weighted_roi),
+        "weight":         overall_weight,
         "reliable":       True,
         "mm_skipped":     mm_skipped,
+        "category_weights": _category_weights(category_stats),
+        **activity,
     }
 
 

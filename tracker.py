@@ -210,6 +210,9 @@ class SignalTracker:
                     "weight":    wallet.get("wallet_weight", 1.0),
                     "roi":       wallet.get("wallet_roi", 0.0),
                     "reliable":  wallet.get("wallet_reliable", False),
+                    "category_weights": wallet.get("category_weights", {}),
+                    "active_recently": wallet.get("active_recently", False),
+                    "trades_14d": wallet.get("trades_14d", 0),
                 })
 
         # Hae markkinatiedot rinnakkain
@@ -271,11 +274,19 @@ class SignalTracker:
                     if addr not in by_wallet or s["size_usdc"] > by_wallet[addr]["size_usdc"]:
                         by_wallet[addr] = s
 
-                weighted_support = sum(s.get("weight", 1.0) for s in by_wallet.values())
+                weighted_support = sum(
+                    self._wallet_market_weight(s, market_type)
+                    for s in by_wallet.values()
+                )
                 positive_roi_support = sum(
                     1 for s in by_wallet.values()
                     if s.get("reliable", False) and s.get("roi", 0.0) > 0
                 )
+                category_positive_support = sum(
+                    1 for s in by_wallet.values()
+                    if self._wallet_category_positive(s, market_type)
+                )
+                active_support = sum(1 for s in by_wallet.values() if s.get("active_recently", False))
                 reliable_support = sum(1 for s in by_wallet.values() if s.get("reliable", False))
                 unknown_support = len(unique_wallets) - reliable_support
 
@@ -286,6 +297,8 @@ class SignalTracker:
                             support_count=len(unique_wallets),
                             weighted_support=weighted_support,
                             positive_roi_support=positive_roi_support,
+                            category_positive_support=category_positive_support,
+                            active_support=active_support,
                         )):
                     signals.append({
                         "market_id":        market_id,
@@ -296,6 +309,8 @@ class SignalTracker:
                         "support_count":    len(unique_wallets),
                         "weighted_support": round(weighted_support, 2),
                         "positive_roi_support": positive_roi_support,
+                        "category_positive_support": category_positive_support,
+                        "active_support": active_support,
                         "reliable_support": reliable_support,
                         "unknown_support": unknown_support,
                         "supporters":       list(unique_wallets),
@@ -689,6 +704,22 @@ class SignalTracker:
         }
         return caps.get(market_type, caps["general"])
 
+    def _wallet_market_weight(self, supporter: Dict[str, Any], market_type: str) -> float:
+        category_weights = supporter.get("category_weights") or {}
+        category = category_weights.get(market_type) or {}
+        weight = float(category.get("weight", supporter.get("weight", 0.7)) or 0.7)
+        if not supporter.get("active_recently", False):
+            weight = min(weight, float(os.getenv("INACTIVE_SIGNAL_MAX_WEIGHT", 0.8)))
+        return weight
+
+    def _wallet_category_positive(self, supporter: Dict[str, Any], market_type: str) -> bool:
+        category_weights = supporter.get("category_weights") or {}
+        category = category_weights.get(market_type) or {}
+        return (
+            bool(category.get("reliable", False)) and
+            float(category.get("weighted_roi", 0.0) or 0.0) > 0
+        )
+
     def _passes_price_rules(self, market_type: str, token_price: float, edge_info: Dict[str, Any]) -> Dict[str, Any]:
         low, high = self._price_bounds(market_type)
         edge = float(edge_info.get("edge", 0.0) or 0.0)
@@ -710,18 +741,26 @@ class SignalTracker:
         support_count: int,
         weighted_support: float,
         positive_roi_support: int,
+        category_positive_support: int,
+        active_support: int,
     ) -> bool:
-        if positive_roi_support >= self.min_positive_roi_support:
+        min_active = int(os.getenv("MIN_ACTIVE_SUPPORT", 1))
+        if active_support < min_active:
+            return False
+
+        if category_positive_support >= self.min_positive_roi_support:
+            pass
+        elif positive_roi_support >= self.min_positive_roi_support and market_type in ("macro", "sports", "general"):
             pass
         elif support_count < self.unknown_support_override:
             return False
 
         if market_type == "esports_map":
             min_support = int(os.getenv("ESPORTS_MAP_MIN_SUPPORT", max(self.smart_threshold + 2, 6)))
-            return support_count >= min_support and weighted_support >= min_support * 0.8
+            return support_count >= min_support and weighted_support + 1e-9 >= min_support * 0.8
         if market_type == "esports_match":
             min_support = int(os.getenv("ESPORTS_MATCH_MIN_SUPPORT", max(self.smart_threshold + 1, 5)))
-            return support_count >= min_support and weighted_support >= min_support * 0.75
+            return support_count >= min_support and weighted_support + 1e-9 >= min_support * 0.75
         return True
 
     def _get_market_info_clob(self, condition_id: str) -> Optional[Dict]:
