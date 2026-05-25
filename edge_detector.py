@@ -284,18 +284,20 @@ class EdgeDetector:
 
     def _market_context_mismatch(self, question: str, context_text: str, description: str) -> bool:
         q = (question or "").lower()
-        ctx = f"{context_text or ''} {description or ''}".lower()
-        if not ctx:
+        ctx = (context_text or "").lower()
+        desc = (description or "").lower()
+        combined = f"{ctx} {desc}"
+        if not combined:
             return False
 
         looks_like_single_game = any(k in q for k in [" vs. ", " vs ", " o/u ", "spread"])
-        looks_like_future_market = any(k in ctx for k in [
+        future_terms = [
             "nba finals", "finals", "championship", "win the nba", "win nba",
             "stanley cup", "world series", "super bowl", "conference finals",
-        ])
-        single_game_words_missing = not any(k in ctx for k in [" vs ", " vs. ", "game", "matchup", "spread", "over/under", "o/u"])
+        ]
+        looks_like_future_market = any(k in combined for k in future_terms)
 
-        if looks_like_single_game and looks_like_future_market and single_game_words_missing:
+        if looks_like_single_game and looks_like_future_market:
             return True
         return False
 
