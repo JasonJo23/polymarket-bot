@@ -164,6 +164,11 @@ def main():
                 # 2. Wallet scoring — vain esikarsitut lompakot
                 log.info("Lasketaan wallet scoret...")
                 scores = score_wallets_batch(pre_qualified, history_cache)
+                try:
+                    from wallet_universe import update_from_scores
+                    update_from_scores(scores)
+                except Exception as e:
+                    log.debug(f"Known wallet universe päivitys epäonnistui: {e}")
 
                 reliable_count    = sum(1 for s in scores.values() if s["reliable"])
                 high_weight_count = sum(1 for s in scores.values() if s["weight"] >= 1.5)

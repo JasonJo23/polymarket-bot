@@ -11,6 +11,7 @@ executed_today.json
 open_positions.json
 market_cache.json
 wallet_score_cache.json
+known_wallets.json
 predictions_log.json
 signal_tracker.txt
 

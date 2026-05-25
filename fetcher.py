@@ -86,8 +86,9 @@ class PolymarketFetcher:
         for m in markets[:3]:
             log.info(f"  📊 {m.get('question','')[:55]} | endDate: {m.get('endDate','')[:10]}")
 
-        # Vaihe 2: Holderit
+        # Vaihe 2: Holderit + pysyvä known-wallet universumi
         wallets = self._collect_wallets_from_holders(markets)
+        wallets = self._merge_known_wallets(wallets)
         log.info(f"Uniikit lompakot: {len(wallets)}")
         if not wallets:
             return []
@@ -275,6 +276,37 @@ class PolymarketFetcher:
             f"Lompakkohaku: {spike_count} volyymi-piikki ({spike_hours}h) + "
             f"{len(combined) - spike_count} top-holder täydennystä = {len(combined)} yhteensä"
         )
+        try:
+            from wallet_universe import add_discovered_wallets
+            add_discovered_wallets(combined, "market_discovery")
+        except Exception as e:
+            log.debug(f"Known wallet päivitys epäonnistui: {e}")
+        return combined
+
+    def _merge_known_wallets(self, wallets: List[str]) -> List[str]:
+        """Lisää mukaan parhaat aiemmin löydetyt walletit konservatiivisella limitillä."""
+        if os.getenv("KNOWN_WALLETS_ENABLED", "true").lower() != "true":
+            return wallets
+        try:
+            from wallet_universe import get_candidate_wallets
+            known_wallets = get_candidate_wallets()
+        except Exception as e:
+            log.debug(f"Known wallet haku epäonnistui: {e}")
+            return wallets
+
+        seen = set()
+        combined = []
+        for wallet in list(wallets) + known_wallets:
+            addr = str(wallet).lower()
+            if addr in seen:
+                continue
+            if addr.startswith("0x") and len(addr) == 42:
+                seen.add(addr)
+                combined.append(addr)
+
+        extra = len(combined) - len(wallets)
+        if extra > 0:
+            log.info(f"Known wallet täydennys: +{extra} aiemmin löydettyä walletia")
         return combined
 
     def _fetch_market_recent_trades(self, condition_id: str, cutoff_ts: int) -> List[Dict]:
