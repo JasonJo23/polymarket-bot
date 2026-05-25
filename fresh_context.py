@@ -156,12 +156,14 @@ class FreshContextFetcher:
             return {}
 
         game = self._detect_esport_game(question)
-        endpoints = ["/v2/matches/upcoming"]
-        if game:
-            endpoints.insert(0, f"/v2/{game}/matches/upcoming")
+        endpoints = self._pandascore_endpoints(game)
 
         headers = {"Authorization": f"Bearer {token}"}
-        params = {"per_page": int(os.getenv("PANDASCORE_MATCH_LIMIT", 20))}
+        params = {
+            "per_page": int(os.getenv("PANDASCORE_MATCH_LIMIT", 50)),
+            "sort": "begin_at",
+        }
+        debug = os.getenv("FRESH_CONTEXT_DEBUG", "false").lower() == "true"
 
         for endpoint in endpoints:
             try:
@@ -172,14 +174,34 @@ class FreshContextFetcher:
                     timeout=8,
                 )
                 if r.status_code != 200:
-                    log.debug(f"PandaScore {r.status_code}: {r.text[:120]}")
+                    log.debug(f"PandaScore {endpoint} {r.status_code}: {r.text[:120]}")
                     continue
                 matches = self._select_pandascore_matches(r.json(), question, teams)
                 if matches:
+                    log.info(f"PandaScore osuma: {endpoint} -> {matches[0].get('name', '')[:60]}")
                     return {"source": ["PandaScore"], "matches": matches}
+                if debug:
+                    log.info(f"PandaScore ei osumaa: {endpoint} | sample={self._sample_pandascore_names(r.json())}")
             except Exception as e:
                 log.debug(f"PandaScore haku epäonnistui: {e}")
         return {}
+
+    def _pandascore_endpoints(self, game: str) -> List[str]:
+        endpoints = []
+        if game:
+            endpoints.extend([
+                f"/v2/{game}/matches/running",
+                f"/v2/{game}/matches/upcoming",
+                f"/v2/{game}/matches/past",
+                f"/v2/{game}/matches",
+            ])
+        endpoints.extend([
+            "/v2/matches/running",
+            "/v2/matches/upcoming",
+            "/v2/matches/past",
+            "/v2/matches",
+        ])
+        return endpoints
 
     def _detect_esport_game(self, question: str) -> str:
         q = question.lower()
@@ -196,7 +218,7 @@ class FreshContextFetcher:
     def _select_pandascore_matches(self, data: Any, question: str, teams: Dict[str, str]) -> List[Dict]:
         if not isinstance(data, list):
             return []
-        wanted = self._tokens(" ".join(teams.values()) or question)
+        wanted = self._team_tokens(teams, question)
         selected = []
         for match in data:
             name = str(match.get("name") or match.get("slug") or "")
@@ -206,7 +228,8 @@ class FreshContextFetcher:
                 if opp.get("name"):
                     opponents.append(str(opp["name"]))
             haystack = " ".join([name] + opponents)
-            if wanted and not (wanted & self._tokens(haystack)):
+            score = self._match_score(wanted, haystack)
+            if wanted and score <= 0:
                 continue
             selected.append({
                 "name": name,
@@ -217,10 +240,18 @@ class FreshContextFetcher:
                 "begin_at": match.get("begin_at", ""),
                 "status": match.get("status", ""),
                 "number_of_games": match.get("number_of_games", ""),
+                "_match_score": score,
             })
-            if len(selected) >= 3:
-                break
-        return selected
+        selected.sort(key=lambda item: (item.get("_match_score", 0), item.get("begin_at", "")), reverse=True)
+        return selected[:3]
+
+    def _sample_pandascore_names(self, data: Any) -> List[str]:
+        if not isinstance(data, list):
+            return []
+        return [
+            str(match.get("name") or match.get("slug") or "")[:60]
+            for match in data[:5]
+        ]
 
     def _fetch_mysportsfeeds(self, question: str, teams: Dict[str, str]) -> Dict[str, Any]:
         api_key = os.getenv("MYSPORTSFEEDS_API_KEY", "")
@@ -376,8 +407,32 @@ class FreshContextFetcher:
         return {
             token
             for token in re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).split()
-            if len(token) >= 3 and token not in stop
+            if len(token) >= 2 and token not in stop
         }
+
+    def _team_tokens(self, teams: Dict[str, str], question: str) -> set:
+        tokens = self._tokens(" ".join(teams.values()) or question)
+        aliases = {
+            "dplus": {"dplus", "kia", "dk"},
+            "kia": {"dplus", "kia", "dk"},
+            "dk": {"dplus", "kia", "dk"},
+            "t1": {"t1"},
+            "gen": {"gen", "geng"},
+            "geng": {"gen", "geng"},
+        }
+        expanded = set(tokens)
+        for token in list(tokens):
+            expanded.update(aliases.get(token, set()))
+        return expanded
+
+    def _match_score(self, wanted: set, haystack: str) -> int:
+        hay_tokens = self._tokens(haystack)
+        score = len(wanted & hay_tokens)
+        hay_lower = haystack.lower()
+        for token in wanted:
+            if token in hay_lower:
+                score += 1
+        return score
 
 
 def jsonish_text(value: Any) -> str:
