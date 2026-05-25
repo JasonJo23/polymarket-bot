@@ -63,6 +63,11 @@ class EdgeDetector:
             clear_context_cache()
         except Exception:
             pass
+        try:
+            from fresh_context import clear_fresh_context_cache
+            clear_fresh_context_cache()
+        except Exception:
+            pass
         if old_size > 0:
             log.debug(f"Analyysicache tyhjennetty ({old_size} merkintää)")
 
@@ -105,6 +110,18 @@ class EdgeDetector:
         except Exception as e:
             log.debug(f"Market context haku epäonnistui: {e}")
 
+        fresh_ctx = {}
+        try:
+            from fresh_context import get_fresh_context
+            fresh_ctx = get_fresh_context(question, market_type)
+        except Exception as e:
+            log.debug(f"Fresh context haku epäonnistui: {e}")
+
+        data_quality = max(
+            float(market_ctx.get("data_quality", 0.0) or 0.0),
+            float(fresh_ctx.get("data_quality", 0.0) or 0.0),
+        )
+
         context = {
             "sport":        self._detect_sport(question),
             "home_team":    "",
@@ -114,7 +131,7 @@ class EdgeDetector:
             "h2h":          [],
             "news":         [],
             "lineup_notes": [],
-            "data_quality": market_ctx.get("data_quality", 0.5),
+            "data_quality": data_quality,
             "fetched_at":   datetime.now(timezone.utc).isoformat(),
             # Lisää Polymarket-konteksti
             "opponents":    market_ctx.get("opponents", ""),
@@ -122,6 +139,9 @@ class EdgeDetector:
             "description":  market_ctx.get("description", ""),
             "crypto_price": market_ctx.get("crypto_price", 0.0),
             "context_text": market_ctx.get("context_text", ""),
+            "fresh_context_text": fresh_ctx.get("context_text", ""),
+            "fresh_data_quality": fresh_ctx.get("data_quality", 0.0),
+            "fresh_sources": fresh_ctx.get("source", []),
         }
 
         # Laske todennäköisyys

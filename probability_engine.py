@@ -179,16 +179,25 @@ class ProbabilityEngine:
 
         # Hae Polymarket-konteksti jos saatavilla
         polymarket_context = context.get("context_text", "")
+        fresh_context = context.get("fresh_context_text", "")
+        fresh_sources = context.get("fresh_sources", [])
         opponents    = context.get("opponents", "")
         tournament   = context.get("tournament", "")
         crypto_price = context.get("crypto_price", 0.0)
 
         # Rakenna kontekstiosio promptiin
-        context_section = ""
+        context_blocks = []
         if polymarket_context and polymarket_context != "Ei lisäkontekstia saatavilla Polymarket API:sta.":
-            context_section = "POLYMARKET-KONTEKSTI:\n" + polymarket_context + "\n"
-        elif context_str and context_str != "Ei lisädataa saatavilla.":
-            context_section = "SAATAVILLA OLEVA DATA:\n" + context_str + "\n"
+            context_blocks.append("POLYMARKET-KONTEKSTI:\n" + polymarket_context)
+        if fresh_context:
+            source_text = f" (lähteet: {', '.join(fresh_sources)})" if fresh_sources else ""
+            context_blocks.append("TUORE DATA" + source_text + ":\n" + fresh_context)
+        if context_str and context_str != "Ei lisädataa saatavilla.":
+            context_blocks.append("MUU SAATAVILLA OLEVA DATA:\n" + context_str)
+
+        context_section = "\n\n".join(context_blocks)
+        if context_section:
+            context_section += "\n"
         else:
             context_section = "Ei ulkoista dataa — käytä yleistietoa ja Polymarket-hintaa lähtökohtana.\n"
 
@@ -212,6 +221,7 @@ OHJE:
 - Jos vastustaja on tiedossa: analysoi tasoero, muoto, kotietua
 - Esports: joukkueiden taso, turnausmuoto (BO1/BO3/BO5), meta
 - NBA/urheilu: joukkueiden vire, playoff-tilanne, loukkaantumiset
+- Jos TUORE DATA on mukana, painota sitä enemmän kuin yleistä historiatietoa
 - Politiikka/makro: historiallinen todennäköisyys, nykytilanne
 - Crypto: ÄLÄ KOSKAAN arvaile krypton nykyistä hintaa — koulutustietosi on vanhentunut. Polymarket-hinta on ainoa luotettava tieto. Jos YES @ 0.52 → markkinat sanovat 52% todennäköisyys. Käytä tätä.
 - Jos et tiedä tarpeeksi → conf "low", our_probability lähelle Polymarket-hintaa
