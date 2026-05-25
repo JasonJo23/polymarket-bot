@@ -121,6 +121,13 @@ class EdgeDetector:
             float(market_ctx.get("data_quality", 0.0) or 0.0),
             float(fresh_ctx.get("data_quality", 0.0) or 0.0),
         )
+        market_context_text = market_ctx.get("context_text", "")
+        market_description = market_ctx.get("description", "")
+        if self._market_context_mismatch(question, market_context_text, market_description):
+            log.warning(f"Polymarket-konteksti hylätty ennen Claudea: {question[:40]}")
+            market_context_text = ""
+            market_description = ""
+            data_quality = float(fresh_ctx.get("data_quality", 0.0) or 0.0)
 
         context = {
             "sport":        self._detect_sport(question),
@@ -136,9 +143,9 @@ class EdgeDetector:
             # Lisää Polymarket-konteksti
             "opponents":    market_ctx.get("opponents", ""),
             "tournament":   market_ctx.get("tournament", ""),
-            "description":  market_ctx.get("description", ""),
+            "description":  market_description,
             "crypto_price": market_ctx.get("crypto_price", 0.0),
-            "context_text": market_ctx.get("context_text", ""),
+            "context_text": market_context_text,
             "fresh_context_text": fresh_ctx.get("context_text", ""),
             "fresh_data_quality": fresh_ctx.get("data_quality", 0.0),
             "fresh_sources": fresh_ctx.get("source", []),
@@ -274,6 +281,23 @@ class EdgeDetector:
             "gta vi",
         ]
         return any(phrase in text for phrase in bad_context_phrases)
+
+    def _market_context_mismatch(self, question: str, context_text: str, description: str) -> bool:
+        q = (question or "").lower()
+        ctx = f"{context_text or ''} {description or ''}".lower()
+        if not ctx:
+            return False
+
+        looks_like_single_game = any(k in q for k in [" vs. ", " vs ", " o/u ", "spread"])
+        looks_like_future_market = any(k in ctx for k in [
+            "nba finals", "finals", "championship", "win the nba", "win nba",
+            "stanley cup", "world series", "super bowl", "conference finals",
+        ])
+        single_game_words_missing = not any(k in ctx for k in [" vs ", " vs. ", "game", "matchup", "spread", "over/under", "o/u"])
+
+        if looks_like_single_game and looks_like_future_market and single_game_words_missing:
+            return True
+        return False
 
     def _approve(self, reason: str, edge: float = 0.0, our_probability: float = 0.5, confidence: str = "medium") -> Dict:
         return {"approved": True, "reason": reason, "edge": edge, "our_probability": our_probability, "confidence": confidence}

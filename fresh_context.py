@@ -240,6 +240,7 @@ class FreshContextFetcher:
                 "begin_at": match.get("begin_at", ""),
                 "status": match.get("status", ""),
                 "number_of_games": match.get("number_of_games", ""),
+                "live_score": self._extract_pandascore_score(match),
                 "_match_score": score,
             })
         selected.sort(key=lambda item: (item.get("_match_score", 0), item.get("begin_at", "")), reverse=True)
@@ -252,6 +253,35 @@ class FreshContextFetcher:
             str(match.get("name") or match.get("slug") or "")[:60]
             for match in data[:5]
         ]
+
+    def _extract_pandascore_score(self, match: Dict[str, Any]) -> str:
+        parts = []
+        for result in match.get("results", []) or []:
+            team_id = result.get("team_id")
+            score = result.get("score")
+            if score is not None:
+                parts.append(f"team_id {team_id}: {score}")
+
+        games = match.get("games", []) or []
+        game_parts = []
+        for game in games[:7]:
+            status = game.get("status", "")
+            winner = game.get("winner") or {}
+            winner_name = winner.get("name") if isinstance(winner, dict) else ""
+            position = game.get("position") or game.get("number") or ""
+            detail = []
+            if position:
+                detail.append(f"game {position}")
+            if status:
+                detail.append(str(status))
+            if winner_name:
+                detail.append(f"winner={winner_name}")
+            if detail:
+                game_parts.append(" ".join(detail))
+
+        if game_parts:
+            parts.append("; ".join(game_parts))
+        return " | ".join(parts)
 
     def _fetch_mysportsfeeds(self, question: str, teams: Dict[str, str]) -> Dict[str, Any]:
         api_key = os.getenv("MYSPORTSFEEDS_API_KEY", "")
@@ -366,6 +396,7 @@ class FreshContextFetcher:
                     match.get("begin_at", ""),
                     f"status={match.get('status', '')}" if match.get("status") else "",
                     f"BO{match.get('number_of_games')}" if match.get("number_of_games") else "",
+                    f"live_score={match.get('live_score')}" if match.get("live_score") else "",
                 ] if v)
                 if detail:
                     lines.append(f"- {detail}")
