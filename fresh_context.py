@@ -190,16 +190,16 @@ class FreshContextFetcher:
         endpoints = []
         if game:
             endpoints.extend([
-                f"/v2/{game}/matches/running",
-                f"/v2/{game}/matches/upcoming",
-                f"/v2/{game}/matches/past",
-                f"/v2/{game}/matches",
+                f"/{game}/matches/running",
+                f"/{game}/matches/upcoming",
+                f"/{game}/matches/past",
+                f"/{game}/matches",
             ])
         endpoints.extend([
-            "/v2/matches/running",
-            "/v2/matches/upcoming",
-            "/v2/matches/past",
-            "/v2/matches",
+            "/matches/running",
+            "/matches/upcoming",
+            "/matches/past",
+            "/matches",
         ])
         return endpoints
 
