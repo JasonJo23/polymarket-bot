@@ -83,6 +83,7 @@ class SignalTracker:
         self.min_signal_size = float(os.getenv("MIN_SIGNAL_SIZE_USDC", 50000))
         self.min_order_usdc  = float(os.getenv("MIN_ORDER_SIZE_USDC", 10))
         self.max_order_usdc  = float(os.getenv("MAX_ORDER_SIZE_USDC", 40))
+        self.min_max_profit_usdc = float(os.getenv("MIN_MAX_PROFIT_USDC", 5))
         self.min_positive_roi_support = int(os.getenv("MIN_POSITIVE_ROI_SUPPORT", 1))
         self.unknown_support_override = int(os.getenv("UNKNOWN_SUPPORT_OVERRIDE", 8))
 
@@ -484,6 +485,10 @@ class SignalTracker:
                 return False
 
             order_size = self._calculate_order_size(signal)
+            profit_check = self._passes_profit_floor(signal["market_type"], token_price, order_size)
+            if not profit_check["approved"]:
+                log.warning(f"Riskisäännöt hylkäsivät tuotto-riskin: {profit_check['reason']}")
+                return False
 
             if self.dry_run:
                 edge = signal.get("edge", {})
@@ -647,6 +652,31 @@ class SignalTracker:
         size = confidence_base * edge_multiplier * market_multiplier * support_multiplier
         market_cap = self._market_order_cap(market_type)
         return max(round(min(size, self.max_order_usdc, market_cap), 2), self.min_order_usdc)
+
+    def _passes_profit_floor(self, market_type: str, token_price: float, order_size: float) -> Dict[str, Any]:
+        """Vältä vetoja, joissa voitto on liian pieni suhteessa panokseen."""
+        if self.min_max_profit_usdc <= 0:
+            return {"approved": True, "reason": "OK"}
+
+        slippage = float(os.getenv("SLIPPAGE_PCT", 0.02))
+        estimated_price = token_price
+        if market_type in ("sports", "esports_match", "esports_map"):
+            estimated_price = min(token_price * (1 + slippage), 0.90)
+
+        if estimated_price <= 0:
+            return {"approved": False, "reason": "virheellinen hinta"}
+
+        max_profit = order_size * ((1 / estimated_price) - 1)
+        if max_profit < self.min_max_profit_usdc:
+            return {
+                "approved": False,
+                "reason": (
+                    f"maksimivoitto {max_profit:.2f} USDC < "
+                    f"{self.min_max_profit_usdc:.2f} USDC "
+                    f"(panos {order_size:.2f}, hinta {estimated_price:.3f})"
+                ),
+            }
+        return {"approved": True, "reason": f"maksimivoitto {max_profit:.2f} USDC"}
 
     def _extract_fill_amounts(self, resp: Any, fallback_usdc: float, price: float) -> tuple:
         """Palauttaa toteutuneen USDC- ja token-määrän CLOB-responsesta."""
