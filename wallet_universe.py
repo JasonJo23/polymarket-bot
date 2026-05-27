@@ -125,6 +125,7 @@ def update_from_scores(scores: Dict[str, Dict]):
             "reliable": reliable,
             "weighted_roi": float(score.get("weighted_roi", 0.0) or 0.0),
             "resolved_count": int(score.get("resolved_count", 0) or 0),
+            "price_coverage": float(score.get("price_coverage", 0.0) or 0.0),
             "trades_7d": int(score.get("trades_7d", 0) or 0),
             "trades_14d": trades_14d,
             "active_recently": active_recently,

@@ -30,6 +30,7 @@ CLOB_BASE   = "https://clob.polymarket.com"
 GAMMA_BASE  = "https://gamma-api.polymarket.com"
 _CACHE_FILE = "market_cache.json"
 _SCORE_CACHE_FILE = "wallet_score_cache.json"
+_SCORE_VERSION = 2
 
 _market_result_cache: Dict[str, Optional[str]] = {}
 _cache_loaded = False
@@ -113,6 +114,7 @@ def _history_fingerprint(trade_history: List[Dict]) -> Dict:
         if iso > latest:
             latest = iso
     return {
+        "version": _SCORE_VERSION,
         "count": len(trade_history),
         "latest": latest,
     }
@@ -181,14 +183,63 @@ def _try_gamma(condition_id: str) -> Optional[str]:
 def _is_market_maker(outcome_sizes: Dict[str, float]) -> bool:
     if len(outcome_sizes) < 2:
         return False
-    total = sum(outcome_sizes.values())
+    total = sum(_position_spend(v) for v in outcome_sizes.values())
     if total <= 0:
         return False
-    return min(outcome_sizes.values()) / total > 0.30
+    return min(_position_spend(v) for v in outcome_sizes.values()) / total > 0.30
 
 
-def _group_trades_by_market(trade_history: List[Dict]) -> Dict[str, Dict[str, float]]:
-    market_positions: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+def _position_spend(position) -> float:
+    if isinstance(position, dict):
+        return float(position.get("spend_usdc", 0.0) or 0.0)
+    return float(position or 0.0)
+
+
+def _position_shares(position) -> float:
+    if isinstance(position, dict):
+        return float(position.get("shares", 0.0) or 0.0)
+    return float(position or 0.0)
+
+
+def _parse_trade_price(trade: Dict) -> Optional[float]:
+    for key in (
+        "price", "avgPrice", "avg_price", "outcomePrice", "outcome_price",
+        "tokenPrice", "token_price",
+    ):
+        raw = trade.get(key)
+        if raw is None:
+            continue
+        try:
+            price = float(raw)
+            if 0.001 <= price <= 0.999:
+                return price
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _parse_size_usdc(trade: Dict) -> float:
+    for key in ("usdcSize", "size", "amount"):
+        raw = trade.get(key)
+        if raw is not None:
+            try:
+                v = float(raw)
+                if v > 0:
+                    return v
+            except (TypeError, ValueError):
+                pass
+    return 0.0
+
+
+def _group_trades_by_market(trade_history: List[Dict]) -> Dict[str, Dict[str, Dict[str, float]]]:
+    market_positions: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(
+        lambda: defaultdict(lambda: {
+            "spend_usdc": 0.0,
+            "shares": 0.0,
+            "priced_trades": 0,
+            "unpriced_trades": 0,
+        })
+    )
     for trade in trade_history:
         if str(trade.get("side", "")).upper() != "BUY":
             continue
@@ -203,19 +254,17 @@ def _group_trades_by_market(trade_history: List[Dict]) -> Dict[str, Dict[str, fl
         outcome = str(trade.get("outcome", "")).upper().strip()
         if not outcome:
             continue
-        size = 0.0
-        for key in ("usdcSize", "size", "amount"):
-            raw = trade.get(key)
-            if raw is not None:
-                try:
-                    v = float(raw)
-                    if v > 0:
-                        size = v
-                        break
-                except (TypeError, ValueError):
-                    pass
+        size = _parse_size_usdc(trade)
         if size > 0:
-            market_positions[condition_id][outcome] += size
+            price = _parse_trade_price(trade)
+            position = market_positions[condition_id][outcome]
+            position["spend_usdc"] += size
+            if price:
+                position["shares"] += size / price
+                position["priced_trades"] += 1
+            else:
+                position["shares"] += size
+                position["unpriced_trades"] += 1
     return market_positions
 
 
@@ -235,8 +284,8 @@ def _market_categories(trade_history: List[Dict]) -> Dict[str, str]:
 
 
 def _calculate_market_roi(outcome_sizes: Dict[str, float], winning_outcome: str) -> Tuple[float, float, float]:
-    total_usdc   = sum(outcome_sizes.values())
-    winning_usdc = outcome_sizes.get(winning_outcome, 0.0)
+    total_usdc = sum(_position_spend(v) for v in outcome_sizes.values())
+    winning_usdc = _position_shares(outcome_sizes.get(winning_outcome, 0.0))
     if total_usdc <= 0:
         return 0.0, 0.0, 0.0
     return round((winning_usdc - total_usdc) / total_usdc, 4), winning_usdc, total_usdc
@@ -359,6 +408,7 @@ def _default_score(address: str, checked: int = 0, correct: int = 0) -> Dict:
         "address": address, "win_rate": 0.5, "avg_roi": 0.0,
         "weighted_roi": 0.0, "resolved_count": checked, "correct_count": correct,
         "total_usdc": 0.0, "weight": unknown_weight, "reliable": False, "mm_skipped": 0,
+        "priced_trades": 0, "unpriced_trades": 0, "price_coverage": 0.0,
         "category_weights": category_weights,
         **_activity_stats([]),
     }
@@ -412,7 +462,7 @@ def calculate_wallet_score(
                 if not _is_market_maker(sizes)]
     _prefetch_outcomes(all_cids)
 
-    correct = checked = mm_skipped = 0
+    correct = checked = mm_skipped = priced_trades = unpriced_trades = 0
     total_roi_sum = weighted_roi_sum = total_usdc_checked = 0.0
     category_stats: Dict[str, Dict] = defaultdict(lambda: {
         "checked": 0,
@@ -429,6 +479,8 @@ def calculate_wallet_score(
         if winner is None:
             continue
         roi, winning_usdc, total_usdc = _calculate_market_roi(outcome_sizes, winner)
+        priced_trades += sum(int(v.get("priced_trades", 0)) for v in outcome_sizes.values() if isinstance(v, dict))
+        unpriced_trades += sum(int(v.get("unpriced_trades", 0)) for v in outcome_sizes.values() if isinstance(v, dict))
         checked            += 1
         total_roi_sum      += roi
         weighted_roi_sum   += roi * total_usdc
@@ -446,6 +498,10 @@ def calculate_wallet_score(
         score = _default_score(wallet_address, checked, correct)
         score.update(activity)
         score["category_weights"] = _category_weights(category_stats)
+        total_price_reads = priced_trades + unpriced_trades
+        score["priced_trades"] = priced_trades
+        score["unpriced_trades"] = unpriced_trades
+        score["price_coverage"] = round(priced_trades / total_price_reads, 3) if total_price_reads else 0.0
         return score
 
     avg_roi      = total_roi_sum / checked
@@ -465,6 +521,11 @@ def calculate_wallet_score(
         "weight":         overall_weight,
         "reliable":       True,
         "mm_skipped":     mm_skipped,
+        "priced_trades":   priced_trades,
+        "unpriced_trades": unpriced_trades,
+        "price_coverage":  round(
+            priced_trades / (priced_trades + unpriced_trades), 3
+        ) if (priced_trades + unpriced_trades) else 0.0,
         "category_weights": _category_weights(category_stats),
         **activity,
     }
@@ -478,8 +539,11 @@ def score_wallets_batch(
     _load_score_cache_from_disk()
     scores = {}
     high_scores = []
+    near_scores = []
+    neutral_scores = []
     low_scores  = []
-    mm_total = no_data = cache_hits = 0
+    mm_total = no_data = cache_hits = priced_total = unpriced_total = 0
+    no_data_resolved_counts = []
 
     for wallet in qualified_wallets:
         addr    = wallet["address"]
@@ -498,20 +562,56 @@ def score_wallets_batch(
             }
         scores[addr] = score
         mm_total += score.get("mm_skipped", 0)
+        priced_total += int(score.get("priced_trades", 0) or 0)
+        unpriced_total += int(score.get("unpriced_trades", 0) or 0)
         if not score["reliable"]:
             no_data += 1
+            no_data_resolved_counts.append(int(score.get("resolved_count", 0) or 0))
         elif score["weight"] >= 1.5:
-            high_scores.append(f"{addr[:10]} w={score['weight']} roi={score['weighted_roi']:+.0%} ({score['resolved_count']} mkts)")
+            high_scores.append(
+                f"{addr[:10]} w={score['weight']} roi={score['weighted_roi']:+.0%} "
+                f"({score['resolved_count']} mkts, pricecov={score.get('price_coverage', 0):.0%})"
+            )
+        elif score["weighted_roi"] >= 0.03:
+            near_scores.append(
+                f"{addr[:10]} w={score['weight']} roi={score['weighted_roi']:+.0%} "
+                f"({score['resolved_count']} mkts, pricecov={score.get('price_coverage', 0):.0%})"
+            )
+        elif score["weighted_roi"] >= 0.0:
+            neutral_scores.append(
+                f"{addr[:10]} w={score['weight']} roi={score['weighted_roi']:+.0%} "
+                f"({score['resolved_count']} mkts, pricecov={score.get('price_coverage', 0):.0%})"
+            )
         elif score["weight"] <= 0.8:
-            low_scores.append(f"{addr[:10]} w={score['weight']} roi={score['weighted_roi']:+.0%} ({score['resolved_count']} mkts)")
+            low_scores.append(
+                f"{addr[:10]} w={score['weight']} roi={score['weighted_roi']:+.0%} "
+                f"({score['resolved_count']} mkts, pricecov={score.get('price_coverage', 0):.0%})"
+            )
 
     # Tallenna cache kerran kaikkien lompakkojen jälkeen
     _batch_save_cache()
     _save_score_cache_to_disk()
 
-    log.info(f"Wallet scoring valmis: {len(high_scores)} korkea | {len(low_scores)} matala | {no_data} ei dataa | {mm_total} MM-kauppaa suodatettu | cache hit {cache_hits}")
+    price_reads = priced_total + unpriced_total
+    price_coverage = priced_total / price_reads if price_reads else 0.0
+    avg_no_data_resolved = (
+        sum(no_data_resolved_counts) / len(no_data_resolved_counts)
+        if no_data_resolved_counts else 0.0
+    )
+    log.info(
+        f"Wallet scoring valmis: {len(high_scores)} korkea | {len(near_scores)} lahella | "
+        f"{len(neutral_scores)} neutraali | {len(low_scores)} matala | {no_data} ei dataa | "
+        f"{mm_total} MM-kauppaa suodatettu | cache hit {cache_hits} | "
+        f"price coverage {price_coverage:.0%}"
+    )
     if high_scores:
         log.info(f"🌟 TOP lompakot: {' | '.join(high_scores[:5])}")
+    if near_scores:
+        log.info(f"LAHELLA HYVAA: {' | '.join(near_scores[:5])}")
+    if neutral_scores:
+        log.info(f"NEUTRAALIT: {' | '.join(neutral_scores[:5])}")
     if low_scores:
         log.info(f"⬇️  HEIKOT: {' | '.join(low_scores[:3])}")
+    if no_data:
+        log.info(f"Ei dataa -walletit: {no_data} kpl | avg resolved={avg_no_data_resolved:.1f}")
     return scores
