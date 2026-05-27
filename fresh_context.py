@@ -368,7 +368,7 @@ class FreshContextFetcher:
                 if r.status_code != 200:
                     log.debug(f"ESPN scoreboard {league} {r.status_code}: {r.text[:120]}")
                     continue
-                selected.extend(self._select_espn_events(r.json(), league, wanted))
+                selected.extend(self._select_espn_events(r.json(), league, wanted, now))
                 if selected:
                     break
             except Exception as e:
@@ -380,7 +380,13 @@ class FreshContextFetcher:
             return {"source": ["ESPN Scoreboard"], "matches": selected[:3]}
         return {}
 
-    def _select_espn_events(self, data: Dict[str, Any], league: str, wanted: set) -> List[Dict[str, Any]]:
+    def _select_espn_events(
+        self,
+        data: Dict[str, Any],
+        league: str,
+        wanted: set,
+        now: datetime,
+    ) -> List[Dict[str, Any]]:
         events = data.get("events", []) if isinstance(data, dict) else []
         selected = []
         for event in events:
@@ -406,17 +412,43 @@ class FreshContextFetcher:
 
             status = competition.get("status", {}).get("type", {}) if competition else {}
             venue = competition.get("venue", {}) if competition else {}
+            begin_at = event.get("date", "")
+            status_text = status.get("description") or status.get("name") or ""
+            relation = self._espn_match_relation(begin_at, status_text, now)
             selected.append({
                 "name": name,
                 "league": league.upper(),
                 "tournament": event.get("season", {}).get("type", ""),
-                "begin_at": event.get("date", ""),
-                "status": status.get("description") or status.get("name") or "",
+                "begin_at": begin_at,
+                "status": status_text,
+                "relation": relation,
                 "live_score": " | ".join(scores),
                 "venue": venue.get("fullName", ""),
                 "_match_score": score,
             })
         return selected
+
+    def _espn_match_relation(self, begin_at: str, status: str, now: datetime) -> str:
+        status_l = (status or "").lower()
+        if any(k in status_l for k in ["in progress", "halftime", "period", "quarter", "inning", "live"]):
+            return "current_live"
+        try:
+            event_dt = datetime.fromisoformat(str(begin_at).replace("Z", "+00:00"))
+        except Exception:
+            event_dt = None
+
+        if event_dt is not None:
+            hours = (event_dt - now).total_seconds() / 3600
+            if hours >= -2 and not any(k in status_l for k in ["final", "postponed", "canceled", "cancelled"]):
+                return "upcoming_or_current"
+            if hours < -2:
+                return "previous_h2h"
+
+        if any(k in status_l for k in ["final", "postponed", "canceled", "cancelled"]):
+            return "previous_h2h"
+        if any(k in status_l for k in ["scheduled", "pre-game", "pre game"]):
+            return "upcoming_or_current"
+        return "unknown"
 
     def _parse_mysports_games(self, data: Dict, question: str, teams: Dict[str, str]) -> List[Dict]:
         games = data.get("games") or data.get("schedule", {}).get("games", []) or []
@@ -491,6 +523,7 @@ class FreshContextFetcher:
             lines = []
             for match in context["matches"][:3]:
                 detail = " | ".join(str(v) for v in [
+                    f"relation={match.get('relation')}" if match.get("relation") else "",
                     match.get("name", ""),
                     match.get("league", ""),
                     match.get("tournament", ""),
