@@ -9,7 +9,7 @@ empty context so the bot can continue normally.
 import os
 import re
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Any, Optional
 
 import requests
@@ -22,6 +22,7 @@ log = logging.getLogger("Scout.FreshContext")
 
 PANDASCORE_BASE = "https://api.pandascore.co"
 MYSPORTS_BASE = "https://api.mysportsfeeds.com/v2.1/pull"
+ESPN_SCOREBOARD_BASE = "https://site.api.espn.com/apis/site/v2/sports"
 
 ESPN_FEEDS = {
     "nba": "https://www.espn.com/espn/rss/nba/news",
@@ -31,6 +32,13 @@ ESPN_FEEDS = {
     "soccer": "https://www.espn.com/espn/rss/soccer/news",
     "esports": "https://www.espn.com/espn/rss/esports/news",
     "general": "https://www.espn.com/espn/rss/news",
+}
+
+ESPN_SCOREBOARD_PATHS = {
+    "nba": "basketball/nba",
+    "mlb": "baseball/mlb",
+    "nhl": "hockey/nhl",
+    "nfl": "football/nfl",
 }
 
 
@@ -67,6 +75,8 @@ class FreshContextFetcher:
             rss = self._fetch_espn_news(question, "esports")
             self._merge(context, rss)
         else:
+            scoreboard = self._fetch_espn_scoreboard(question, teams)
+            self._merge(context, scoreboard)
             sports = self._fetch_mysportsfeeds(question, teams)
             self._merge(context, sports)
             rss = self._fetch_espn_news(question, self._detect_sport_feed(question))
@@ -126,11 +136,24 @@ class FreshContextFetcher:
 
     def _detect_sport_feed(self, question: str) -> str:
         q = question.lower()
-        if any(k in q for k in ["nba", "lakers", "knicks", "thunder", "spurs", "celtics", "cavaliers"]):
+        if any(k in q for k in [
+            "nba", "lakers", "knicks", "thunder", "spurs", "celtics", "cavaliers",
+            "warriors", "mavericks", "nuggets", "wolves", "timberwolves", "pacers",
+            "bucks", "heat", "magic", "raptors", "bulls", "suns", "clippers",
+        ]):
             return "nba"
-        if any(k in q for k in ["nhl", "canadiens", "hurricanes", "oilers", "panthers"]):
+        if any(k in q for k in [
+            "nhl", "canadiens", "hurricanes", "oilers", "panthers", "rangers",
+            "bruins", "leafs", "maple leafs", "stars", "avalanche", "golden knights",
+            "jets", "kings", "devils", "lightning",
+        ]):
             return "nhl"
-        if any(k in q for k in ["mlb", "yankees", "dodgers", "pirates", "cardinals"]):
+        if any(k in q for k in [
+            "mlb", "yankees", "dodgers", "pirates", "cardinals", "phillies",
+            "padres", "mets", "braves", "red sox", "blue jays", "orioles",
+            "cubs", "brewers", "giants", "mariners", "astros", "rangers",
+            "diamondbacks", "guardians", "twins", "tigers", "royals",
+        ]):
             return "mlb"
         if any(k in q for k in ["nfl", "chiefs", "eagles", "cowboys"]):
             return "nfl"
@@ -317,6 +340,84 @@ class FreshContextFetcher:
         feed = self._detect_sport_feed(question)
         return feed if feed in ("nba", "nhl", "mlb", "nfl") else ""
 
+    def _fetch_espn_scoreboard(self, question: str, teams: Dict[str, str]) -> Dict[str, Any]:
+        league = self._detect_sport_feed(question)
+        path = ESPN_SCOREBOARD_PATHS.get(league)
+        if not path:
+            return {}
+
+        wanted = self._team_tokens(teams, question)
+        if not wanted:
+            return {}
+
+        selected = []
+        now = datetime.now(timezone.utc)
+        lookback = int(os.getenv("ESPN_SCOREBOARD_LOOKBACK_DAYS", 1))
+        lookahead = int(os.getenv("ESPN_SCOREBOARD_LOOKAHEAD_DAYS", 7))
+        for offset in range(-lookback, lookahead + 1):
+            day = now + timedelta(days=offset)
+            try:
+                r = self.session.get(
+                    f"{ESPN_SCOREBOARD_BASE}/{path}/scoreboard",
+                    params={
+                        "dates": day.strftime("%Y%m%d"),
+                        "limit": int(os.getenv("ESPN_SCOREBOARD_LIMIT", 100)),
+                    },
+                    timeout=8,
+                )
+                if r.status_code != 200:
+                    log.debug(f"ESPN scoreboard {league} {r.status_code}: {r.text[:120]}")
+                    continue
+                selected.extend(self._select_espn_events(r.json(), league, wanted))
+                if selected:
+                    break
+            except Exception as e:
+                log.debug(f"ESPN scoreboard haku epÃ¤onnistui: {e}")
+
+        selected.sort(key=lambda item: (item.get("_match_score", 0), item.get("begin_at", "")), reverse=True)
+        if selected:
+            log.info(f"ESPN scoreboard osuma: {league} -> {selected[0].get('name', '')[:60]}")
+            return {"source": ["ESPN Scoreboard"], "matches": selected[:3]}
+        return {}
+
+    def _select_espn_events(self, data: Dict[str, Any], league: str, wanted: set) -> List[Dict[str, Any]]:
+        events = data.get("events", []) if isinstance(data, dict) else []
+        selected = []
+        for event in events:
+            competitions = event.get("competitions", []) or []
+            competition = competitions[0] if competitions else {}
+            competitors = competition.get("competitors", []) or []
+            teams = []
+            scores = []
+            for comp in competitors:
+                team = comp.get("team", {}) or {}
+                name = team.get("displayName") or team.get("shortDisplayName") or team.get("name") or ""
+                abbr = team.get("abbreviation") or ""
+                if name:
+                    teams.append(str(name))
+                if comp.get("score") not in (None, ""):
+                    scores.append(f"{abbr or name}: {comp.get('score')}")
+
+            name = event.get("name") or " vs ".join(teams)
+            haystack = " ".join([name] + teams)
+            score = self._match_score(wanted, haystack)
+            if score <= 0:
+                continue
+
+            status = competition.get("status", {}).get("type", {}) if competition else {}
+            venue = competition.get("venue", {}) if competition else {}
+            selected.append({
+                "name": name,
+                "league": league.upper(),
+                "tournament": event.get("season", {}).get("type", ""),
+                "begin_at": event.get("date", ""),
+                "status": status.get("description") or status.get("name") or "",
+                "live_score": " | ".join(scores),
+                "venue": venue.get("fullName", ""),
+                "_match_score": score,
+            })
+        return selected
+
     def _parse_mysports_games(self, data: Dict, question: str, teams: Dict[str, str]) -> List[Dict]:
         games = data.get("games") or data.get("schedule", {}).get("games", []) or []
         wanted = self._tokens(" ".join(teams.values()) or question)
@@ -397,6 +498,7 @@ class FreshContextFetcher:
                     f"status={match.get('status', '')}" if match.get("status") else "",
                     f"BO{match.get('number_of_games')}" if match.get("number_of_games") else "",
                     f"live_score={match.get('live_score')}" if match.get("live_score") else "",
+                    f"venue={match.get('venue')}" if match.get("venue") else "",
                 ] if v)
                 if detail:
                     lines.append(f"- {detail}")
