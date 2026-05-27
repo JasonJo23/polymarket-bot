@@ -196,11 +196,26 @@ def main():
                 signals = tracker.process(qualified_wallets, raw_trades, wallet_scores=scores)
 
                 if signals:
-                    log.info(f"🔥 Smart Follow -signaaleja: {len(signals)}")
+                    funnel = getattr(tracker, "last_funnel_stats", {}) or {}
+                    if funnel:
+                        log.info(
+                            "Funnel-yhteenveto: "
+                            f"outcomes={funnel.get('outcome_candidates', 0)} | "
+                            f"kandidaatit={funnel.get('accepted_candidates', 0)} | "
+                            f"hinta={funnel.get('price_extreme', 0)} | "
+                            f"suljettu={funnel.get('market_closed_or_missing', 0)} | "
+                            f"myoha/vola={funnel.get('late_or_volatile', 0)} | "
+                            f"wallet/size={funnel.get('wallet_quality_or_size', 0)}"
+                        )
+                    log.info(f"Smart Follow -kandidaatteja jatkotarkastukseen: {len(signals)}")
                     for sig in signals[:20]:
                         log.info(
                             f"  🎯 {sig.get('question','')[:45]} | "
                             f"Tuki: {sig['support_count']} lompakon | "
+                            f"w={sig.get('weighted_support', 0):.2f} | "
+                            f"high={sig.get('high_weight_support', 0)} | "
+                            f"hinta={sig.get('token_price', 0):.3f} | "
+                            f"liike={sig.get('price_move_since_first_seen', 0):+.3f} | "
                             f"Outcome: {sig['outcome']} | "
                             f"Koko: {sig['total_size_usdc']:.0f} USDC"
                         )
@@ -211,7 +226,10 @@ def main():
                         and s["total_size_usdc"] >= min_signal_size
                     ]
 
-                    log.info(f"Vahvoja signaaleja: {len(strong_signals)} – {'ostetaan' if not dry_run else 'simuloidaan'}")
+                    log.info(
+                        f"Jatkotarkastukseen hyvaksyttyja kandidaatteja: {len(strong_signals)} - "
+                        f"{'yritetaan ostaa' if not dry_run else 'simuloidaan'}"
+                    )
 
                     orders_this_cycle = 0
                     for sig in strong_signals:

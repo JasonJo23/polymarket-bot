@@ -14,6 +14,8 @@ wallet_score_cache.json
 known_wallets.json
 predictions_log.json
 signal_tracker.txt
+signal_state.json
+signal_snapshots.jsonl
 
 # Local scratch/debug files
 debug*.py

@@ -23,6 +23,7 @@ KORJAUKSET v6.0 → v7.0:
 
 from typing import Optional, Dict, List, Any, Set
 import os
+import json
 import logging
 import requests
 from datetime import datetime, timezone, timedelta, date
@@ -33,6 +34,8 @@ log = logging.getLogger("Scout.Tracker")
 
 CLOB_BASE  = "https://clob.polymarket.com"
 GAMMA_BASE = "https://gamma-api.polymarket.com"
+_SIGNAL_STATE_FILE = "signal_state.json"
+_SIGNAL_SNAPSHOTS_FILE = "signal_snapshots.jsonl"
 
 _edge_detector_instance = None
 
@@ -87,11 +90,16 @@ class SignalTracker:
         self.min_max_profit_usdc = float(os.getenv("MIN_MAX_PROFIT_USDC", 5))
         self.min_positive_roi_support = int(os.getenv("MIN_POSITIVE_ROI_SUPPORT", 1))
         self.unknown_support_override = int(os.getenv("UNKNOWN_SUPPORT_OVERRIDE", 8))
+        self.max_signal_price_move = float(os.getenv("MAX_SIGNAL_PRICE_MOVE", 0.10))
 
         self._executed_file   = "executed_today.json"
         self._executed_today: Set[str] = set()  # Sisältää vain market_id:t (ei outcomea)
         self._load_executed()
         self._market_cache: Dict[str, Dict] = {}
+        self._signal_state: Dict[str, Dict[str, Any]] = read_json(_SIGNAL_STATE_FILE, {"signals": {}})
+        if not isinstance(self._signal_state, dict):
+            self._signal_state = {"signals": {}}
+        self.last_funnel_stats: Dict[str, int] = {}
 
         if dry_run:
             log.warning("DRY RUN -tila – ostoja ei tehdä.")
@@ -269,22 +277,32 @@ class SignalTracker:
 
         # Rakenna signaalit
         signals = []
+        funnel = defaultdict(int)
+        funnel["markets_seen"] = len(market_support)
+        now_dt = datetime.now(timezone.utc)
         for market_id, outcomes in market_support.items():
             market_info = market_infos.get(market_id, {})
             if not market_info or not market_info.get("accepting_orders", False):
+                funnel["market_closed_or_missing"] += 1
                 continue
 
-            # Hylkää markkinat joissa hinta jo yli 0.90 (konsenssus selvä)
             tokens = market_info.get("tokens", [])
-            prices = [float(t.get("price", 0.5)) for t in tokens if t.get("price")]
-            if prices and max(prices) > 0.90:
-                continue
-
             question = market_info.get("question", market_id[:20])
             end_date = market_info.get("end_date_iso", "")
             market_type = self._classify_market(question)
 
             for outcome, supporters in outcomes.items():
+                funnel["outcome_candidates"] += 1
+                token_price = self._token_price_for_outcome(tokens, outcome)
+                if token_price is None:
+                    funnel["missing_price"] += 1
+                    continue
+
+                price_check = self._passes_candidate_price_rules(market_type, token_price)
+                if not price_check["approved"]:
+                    funnel["price_extreme"] += 1
+                    continue
+
                 unique_wallets = {s["wallet"] for s in supporters}
                 total_size     = sum(s["size_usdc"] for s in supporters)
 
@@ -309,6 +327,27 @@ class SignalTracker:
                 active_support = sum(1 for s in by_wallet.values() if s.get("active_recently", False))
                 reliable_support = sum(1 for s in by_wallet.values() if s.get("reliable", False))
                 unknown_support = len(unique_wallets) - reliable_support
+                high_weight_support = sum(
+                    1 for s in by_wallet.values()
+                    if self._wallet_market_weight(s, market_type) >= 1.5
+                )
+                timing = self._update_signal_timing(
+                    market_id=market_id,
+                    outcome=outcome,
+                    token_price=token_price,
+                    now_dt=now_dt,
+                )
+                if abs(timing["price_move_since_first_seen"]) > self.max_signal_price_move:
+                    funnel["late_or_volatile"] += 1
+                    self._append_signal_snapshot({
+                        "market_id": market_id,
+                        "question": question,
+                        "outcome": outcome,
+                        "market_type": market_type,
+                        "token_price": token_price,
+                        **timing,
+                    }, status="rejected_late_or_volatile")
+                    continue
 
                 if (len(unique_wallets) >= self.smart_threshold and
                         total_size >= self.min_signal_size and
@@ -319,6 +358,7 @@ class SignalTracker:
                             positive_roi_support=positive_roi_support,
                             category_positive_support=category_positive_support,
                             active_support=active_support,
+                            high_weight_support=high_weight_support,
                         )):
                     signals.append({
                         "market_id":        market_id,
@@ -326,8 +366,10 @@ class SignalTracker:
                         "end_date":         end_date if end_date else "?",
                         "outcome":          outcome,
                         "market_type":      market_type,
+                        "token_price":       token_price,
                         "support_count":    len(unique_wallets),
                         "weighted_support": round(weighted_support, 2),
+                        "high_weight_support": high_weight_support,
                         "positive_roi_support": positive_roi_support,
                         "category_positive_support": category_positive_support,
                         "active_support": active_support,
@@ -336,7 +378,12 @@ class SignalTracker:
                         "supporters":       list(unique_wallets),
                         "total_size_usdc":  total_size,
                         "timestamp":        datetime.now(timezone.utc).isoformat(),
+                        **timing,
                     })
+                    funnel["accepted_candidates"] += 1
+                    self._append_signal_snapshot(signals[-1], status="accepted_candidate")
+                else:
+                    funnel["wallet_quality_or_size"] += 1
 
         # Yksi paras per markkina
         best_per_market: Dict[str, Dict] = {}
@@ -356,6 +403,19 @@ class SignalTracker:
         signals.sort(
             key=lambda s: (s["weighted_support"], s["total_size_usdc"]),
             reverse=True
+        )
+        self._save_signal_state()
+        self.last_funnel_stats = dict(funnel)
+        log.info(
+            "Signal funnel: "
+            f"markets={funnel['markets_seen']} | "
+            f"outcomes={funnel['outcome_candidates']} | "
+            f"accepted={funnel['accepted_candidates']} | "
+            f"closed/missing={funnel['market_closed_or_missing']} | "
+            f"price_extreme={funnel['price_extreme']} | "
+            f"late/volatile={funnel['late_or_volatile']} | "
+            f"wallet_quality/size={funnel['wallet_quality_or_size']} | "
+            f"missing_price={funnel['missing_price']}"
         )
         return signals
 
@@ -816,6 +876,123 @@ class SignalTracker:
             return {"approved": False, "reason": f"{market_type} hinta liian korkea {token_price:.3f} > {high:.2f}"}
         return {"approved": True, "reason": "OK"}
 
+    def _passes_candidate_price_rules(self, market_type: str, token_price: float) -> Dict[str, Any]:
+        low, high = self._price_bounds(market_type)
+        buffer = float(os.getenv("CANDIDATE_PRICE_BUFFER", 0.02))
+        low = max(0.01, low - buffer)
+        high = min(0.99, high + buffer)
+        if token_price < low:
+            return {"approved": False, "reason": f"{market_type} candidate price too low {token_price:.3f} < {low:.2f}"}
+        if token_price > high:
+            return {"approved": False, "reason": f"{market_type} candidate price too high {token_price:.3f} > {high:.2f}"}
+        return {"approved": True, "reason": "OK"}
+
+    def _token_price_for_outcome(self, tokens: List[Dict[str, Any]], outcome_name: str) -> Optional[float]:
+        def _normalize(s: str) -> str:
+            import re
+            s = str(s or "").upper()
+            s = s.replace("'", "").replace("`", "")
+            s = re.sub(r"[^A-Z0-9 ]", " ", s)
+            return re.sub(r"\s+", " ", s).strip()
+
+        outcome_norm = _normalize(outcome_name)
+        fallback = None
+        for token in tokens or []:
+            t_norm = _normalize(token.get("outcome", ""))
+            if not t_norm:
+                continue
+            try:
+                price = round(float(token.get("price", 0.0)), 3)
+            except (TypeError, ValueError):
+                continue
+            if t_norm == outcome_norm or t_norm.replace(" ", "") == outcome_norm.replace(" ", ""):
+                return price
+            if outcome_norm in t_norm or t_norm in outcome_norm:
+                fallback = price
+        return fallback
+
+    def _update_signal_timing(
+        self,
+        market_id: str,
+        outcome: str,
+        token_price: float,
+        now_dt: datetime,
+    ) -> Dict[str, Any]:
+        signals = self._signal_state.setdefault("signals", {})
+        key = f"{market_id}|{outcome}"
+        entry = signals.get(key)
+        now_iso = now_dt.isoformat()
+        if not entry:
+            entry = {
+                "first_seen_at": now_iso,
+                "price_at_first_seen": token_price,
+            }
+            signals[key] = entry
+
+        first_seen_at = entry.get("first_seen_at", now_iso)
+        first_price = float(entry.get("price_at_first_seen", token_price) or token_price)
+        try:
+            first_dt = datetime.fromisoformat(first_seen_at)
+            age_minutes = max(0.0, (now_dt - first_dt).total_seconds() / 60)
+        except Exception:
+            age_minutes = 0.0
+
+        entry["last_seen_at"] = now_iso
+        entry["last_price"] = token_price
+        return {
+            "first_seen_at": first_seen_at,
+            "price_at_first_seen": round(first_price, 3),
+            "signal_age_minutes": round(age_minutes, 1),
+            "price_move_since_first_seen": round(token_price - first_price, 3),
+        }
+
+    def _save_signal_state(self) -> None:
+        signals = self._signal_state.get("signals", {})
+        cutoff = datetime.now(timezone.utc) - timedelta(days=int(os.getenv("SIGNAL_STATE_RETENTION_DAYS", 7)))
+        kept = {}
+        for key, entry in signals.items():
+            try:
+                last_seen = datetime.fromisoformat(entry.get("last_seen_at") or entry.get("first_seen_at"))
+            except Exception:
+                continue
+            if last_seen >= cutoff:
+                kept[key] = entry
+        self._signal_state["signals"] = kept
+        try:
+            write_json(_SIGNAL_STATE_FILE, self._signal_state)
+        except Exception as e:
+            log.debug(f"Signal state tallennus epÃ¤onnistui: {e}")
+
+    def _append_signal_snapshot(self, signal: Dict[str, Any], status: str) -> None:
+        if os.getenv("SIGNAL_SNAPSHOT_ENABLED", "true").lower() != "true":
+            return
+        snapshot = {
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "status": status,
+            "market_id": signal.get("market_id"),
+            "question": signal.get("question"),
+            "outcome": signal.get("outcome"),
+            "market_type": signal.get("market_type"),
+            "token_price": signal.get("token_price"),
+            "price_at_first_seen": signal.get("price_at_first_seen"),
+            "price_move_since_first_seen": signal.get("price_move_since_first_seen"),
+            "signal_age_minutes": signal.get("signal_age_minutes"),
+            "support_count": signal.get("support_count"),
+            "weighted_support": signal.get("weighted_support"),
+            "high_weight_support": signal.get("high_weight_support"),
+            "positive_roi_support": signal.get("positive_roi_support"),
+            "category_positive_support": signal.get("category_positive_support"),
+            "active_support": signal.get("active_support"),
+            "reliable_support": signal.get("reliable_support"),
+            "unknown_support": signal.get("unknown_support"),
+            "total_size_usdc": signal.get("total_size_usdc"),
+        }
+        try:
+            with open(_SIGNAL_SNAPSHOTS_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(snapshot, ensure_ascii=True) + "\n")
+        except Exception as e:
+            log.debug(f"Signal snapshot tallennus epÃ¤onnistui: {e}")
+
     def _passes_wallet_quality(
         self,
         market_type: str,
@@ -824,9 +1001,18 @@ class SignalTracker:
         positive_roi_support: int,
         category_positive_support: int,
         active_support: int,
+        high_weight_support: int = 0,
     ) -> bool:
         min_active = int(os.getenv("MIN_ACTIVE_SUPPORT", 1))
         if active_support < min_active:
+            return False
+
+        min_weighted_ratio = float(os.getenv("MIN_WEIGHTED_SUPPORT_RATIO", 0.75))
+        if weighted_support + 1e-9 < support_count * min_weighted_ratio:
+            return False
+
+        min_high_weight = int(os.getenv("MIN_HIGH_WEIGHT_SUPPORT", 0))
+        if high_weight_support < min_high_weight:
             return False
 
         if category_positive_support >= self.min_positive_roi_support:
