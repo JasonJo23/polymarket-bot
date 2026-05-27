@@ -15,6 +15,7 @@ import logging
 import requests
 from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional, Tuple
+from state_store import read_json, write_json
 
 log = logging.getLogger("Scout.PositionManager")
 
@@ -273,17 +274,14 @@ def _evaluate_macro_position(position: Dict) -> Tuple[bool, str]:
 
 
 def load_positions() -> List[Dict]:
-    try:
-        with open("open_positions.json", "r") as f:
-            return json.load(f).get("positions", [])
-    except (FileNotFoundError, Exception):
-        return []
+    data = read_json("open_positions.json", {"positions": []})
+    positions = data.get("positions", []) if isinstance(data, dict) else []
+    return positions if isinstance(positions, list) else []
 
 
 def save_positions(positions: List[Dict]):
     try:
-        with open("open_positions.json", "w") as f:
-            json.dump({"positions": positions}, f, indent=2)
+        write_json("open_positions.json", {"positions": positions}, indent=2)
     except Exception as e:
         log.warning(f"Positioiden tallennus epäonnistui: {e}")
 

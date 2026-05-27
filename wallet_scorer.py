@@ -22,6 +22,7 @@ import requests
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
+from state_store import read_json, write_json
 
 log = logging.getLogger("Scout.WalletScorer")
 
@@ -42,8 +43,7 @@ def _load_cache_from_disk():
         return
     _cache_loaded = True
     try:
-        with open(_CACHE_FILE, "r") as f:
-            data = json.load(f)
+        data = read_json(_CACHE_FILE, {})
         _market_result_cache.update(data)
         resolved = sum(1 for v in data.values() if v is not None)
         log.info(f"Market cache ladattu: {len(data)} merkintää ({resolved} ratkaistu)")
@@ -56,8 +56,7 @@ def _load_cache_from_disk():
 def _save_cache_to_disk():
     try:
         to_save = {k: v for k, v in _market_result_cache.items() if v is not None}
-        with open(_CACHE_FILE, "w") as f:
-            json.dump(to_save, f)
+        write_json(_CACHE_FILE, to_save)
     except Exception as e:
         log.debug(f"Cache tallennus epäonnistui: {e}")
 
@@ -87,8 +86,7 @@ def _load_score_cache_from_disk():
         return
     _score_cache_loaded = True
     try:
-        with open(_SCORE_CACHE_FILE, "r") as f:
-            data = json.load(f)
+        data = read_json(_SCORE_CACHE_FILE, {})
         if isinstance(data, dict):
             _wallet_score_cache.update(data)
         log.info(f"Wallet score cache ladattu: {len(_wallet_score_cache)} lompakkoa")
@@ -100,8 +98,7 @@ def _load_score_cache_from_disk():
 
 def _save_score_cache_to_disk():
     try:
-        with open(_SCORE_CACHE_FILE, "w") as f:
-            json.dump(_wallet_score_cache, f)
+        write_json(_SCORE_CACHE_FILE, _wallet_score_cache)
     except Exception as e:
         log.debug(f"Wallet score cache tallennus epäonnistui: {e}")
 

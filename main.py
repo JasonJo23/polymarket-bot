@@ -23,6 +23,7 @@ from fetcher import GammaFetcher
 from analyzer import WalletAnalyzer
 from tracker import SignalTracker
 from wallet_scorer import score_wallets_batch
+from state_store import read_json, write_json
 
 load_dotenv()
 
@@ -90,21 +91,18 @@ def main():
     today_str        = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     daily_spent_usdc = 0.0
 
-    import json as _json
     _spending_file = "daily_spending.json"
     try:
-        with open(_spending_file) as f:
-            _data = _json.load(f)
-            if _data.get("date") == today_str:
-                daily_spent_usdc = float(_data.get("spent", 0))
-                log.info(f"Ladattu päiväkulut: {daily_spent_usdc:.2f} USDC")
+        _data = read_json(_spending_file, {})
+        if _data.get("date") == today_str:
+            daily_spent_usdc = float(_data.get("spent", 0))
+            log.info(f"Ladattu päiväkulut: {daily_spent_usdc:.2f} USDC")
     except Exception:
         pass
 
     def save_spending():
         try:
-            with open(_spending_file, "w") as f:
-                _json.dump({"date": today_str, "spent": daily_spent_usdc}, f)
+            write_json(_spending_file, {"date": today_str, "spent": daily_spent_usdc})
         except Exception:
             pass
 

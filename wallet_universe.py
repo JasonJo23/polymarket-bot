@@ -11,6 +11,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from typing import Dict, List
+from state_store import read_json, write_json
 
 log = logging.getLogger("Scout.WalletUniverse")
 
@@ -48,6 +49,29 @@ def _save(wallets: Dict[str, Dict]):
         )[:max_wallets]
         with open(UNIVERSE_FILE, "w") as f:
             json.dump({"wallets": dict(ranked), "updated_at": _now()}, f, indent=2)
+    except Exception as e:
+        log.debug(f"Known wallet tallennus epäonnistui: {e}")
+
+
+def _load() -> Dict[str, Dict]:
+    data = read_json(UNIVERSE_FILE, {"wallets": {}})
+    wallets = data.get("wallets", {}) if isinstance(data, dict) else {}
+    return wallets if isinstance(wallets, dict) else {}
+
+
+def _save(wallets: Dict[str, Dict]):
+    try:
+        max_wallets = int(os.getenv("KNOWN_WALLET_MAX_STORED", 1000))
+        ranked = sorted(
+            wallets.items(),
+            key=lambda item: (
+                float(item[1].get("weight", 0.0) or 0.0),
+                int(item[1].get("trades_14d", 0) or 0),
+                item[1].get("last_seen", ""),
+            ),
+            reverse=True,
+        )[:max_wallets]
+        write_json(UNIVERSE_FILE, {"wallets": dict(ranked), "updated_at": _now()}, indent=2)
     except Exception as e:
         log.debug(f"Known wallet tallennus epäonnistui: {e}")
 

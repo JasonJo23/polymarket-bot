@@ -27,6 +27,7 @@ import logging
 import requests
 from datetime import datetime, timezone, timedelta, date
 from collections import defaultdict
+from state_store import read_json, write_json
 
 log = logging.getLogger("Scout.Tracker")
 
@@ -110,10 +111,8 @@ class SignalTracker:
         (esim. "0xabc_AURORA") joka filtteröitiin pois '_' tarkistuksella.
         Nyt tallennetaan ja luetaan pelkkä market_id ilman suffiksia.
         """
-        import json as _json
         try:
-            with open(self._executed_file, "r") as f:
-                data = _json.load(f)
+            data = read_json(self._executed_file, {"signals": []})
 
             signals = data.get("signals", [])
             if not signals:
@@ -141,8 +140,8 @@ class SignalTracker:
 
             log.info(f"Ladattu {len(self._executed_today)} ostettua markkinaa (48h muisti).")
 
-        except (FileNotFoundError, Exception):
-            pass
+        except Exception as e:
+            log.debug(f"Ostomuistin lataus epäonnistui: {e}")
 
     def _save_executed(self):
         """Tallentaa ostetut markkinat uudella formaatilla (dict + timestamp)."""
@@ -170,6 +169,26 @@ class SignalTracker:
 
             with open(self._executed_file, "w") as f:
                 _json.dump({"signals": existing}, f)
+        except Exception as e:
+            log.warning(f"Signaalien tallennus epäonnistui: {e}")
+
+    def _save_executed(self):
+        """Tallentaa ostetut markkinat atomisesti."""
+        try:
+            data = read_json(self._executed_file, {"signals": []})
+            existing = data.get("signals", [])
+            if existing and isinstance(existing[0], str):
+                existing = []
+
+            existing_ids = {s.get("market_id") for s in existing if isinstance(s, dict)}
+            for market_id in self._executed_today:
+                if market_id not in existing_ids:
+                    existing.append({
+                        "market_id": market_id,
+                        "bought_at": datetime.now().isoformat(),
+                    })
+
+            write_json(self._executed_file, {"signals": existing})
         except Exception as e:
             log.warning(f"Signaalien tallennus epäonnistui: {e}")
 
@@ -353,9 +372,7 @@ class SignalTracker:
 
         # Tarkista vastakkainen positio
         try:
-            import json as _j
-            with open("open_positions.json", "r") as f:
-                open_pos = _j.load(f).get("positions", [])
+            open_pos = read_json("open_positions.json", {"positions": []}).get("positions", [])
             for pos in open_pos:
                 if pos.get("market_id") == sig_key:
                     existing_outcome = pos.get("outcome", "")
@@ -577,8 +594,9 @@ class SignalTracker:
             log.info(f"✅ Osto tehty: {resp}")
             status = resp.get("status", "") if isinstance(resp, dict) else getattr(resp, "status", "")
             filled_usdc, filled_tokens = self._extract_fill_amounts(resp, order_size, exec_price)
+            has_fill_amounts = filled_usdc > 0 and filled_tokens > 0
 
-            if status in ("matched", "delayed"):
+            if status == "matched" and has_fill_amounts:
                 token_amount = round(filled_tokens, 4)
                 try:
                     from position_manager import add_position
@@ -594,6 +612,14 @@ class SignalTracker:
                 try:
                     from notifier import notifier
                     if notifier:
+                        notifier.notify_buy(signal, exec_price, filled_usdc, status)
+                except Exception:
+                    pass
+            elif status == "delayed":
+                log.warning("Order delayed ilman varmaa fill-määrää — positiota ei lisätä vielä")
+                try:
+                    from notifier import notifier
+                    if notifier:
                         notifier.notify_buy(signal, exec_price, order_size, status)
                 except Exception:
                     pass
@@ -602,7 +628,7 @@ class SignalTracker:
 
             self._executed_today.add(sig_key)
             self._save_executed()
-            signal["_actual_order_size"] = filled_usdc if status in ("matched", "delayed") else 0
+            signal["_actual_order_size"] = filled_usdc if status == "matched" and has_fill_amounts else 0
             return True
 
         except Exception as e:
@@ -694,6 +720,9 @@ class SignalTracker:
         taking = _num("takingAmount")
         if making > 0 and taking > 0:
             return making, taking
+
+        if str(resp.get("status", "")).lower() == "delayed":
+            return 0.0, 0.0
 
         tokens = fallback_usdc / price if price > 0 else 0.0
         return fallback_usdc, tokens
