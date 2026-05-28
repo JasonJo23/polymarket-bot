@@ -26,6 +26,7 @@ import os
 import json
 import logging
 import requests
+import re
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
@@ -184,6 +185,7 @@ class ProbabilityEngine:
         opponents    = context.get("opponents", "")
         tournament   = context.get("tournament", "")
         crypto_price = context.get("crypto_price", 0.0)
+        time_context = self._build_time_context(question, context)
 
         # Rakenna kontekstiosio promptiin
         context_blocks = []
@@ -212,6 +214,7 @@ MARKKINA: {question}
 ARVIOITAVA OUTCOME: {outcome}
 POLYMARKET-HINTA: {polymarket_price:.3f} ({polymarket_price*100:.1f}%)
 LAJI: {sport}
+{time_context}
 {f"OTTELU: {opponents}" if opponents else ""}
 {f"TURNAUS: {tournament}" if tournament else ""}
 
@@ -236,6 +239,44 @@ Vastaa VAIN JSON, ei muuta tekstiä:
 }}"""
 
         return prompt
+
+    def _build_time_context(self, question: str, context: Dict[str, Any]) -> str:
+        now = datetime.now(timezone.utc)
+        lines = [f"AIKAKONTEKSTI: nykyhetki UTC {now.date().isoformat()}"]
+
+        end_date = str(context.get("market_end_date", "") or "").strip()
+        if end_date and end_date != "?":
+            lines.append(f"MARKKINAN END_DATE: {end_date}")
+            days = self._days_until(end_date, now)
+            if days is not None:
+                lines.append(f"END_DATE ON NYKYHETKESTA: {days:+d} paivaa")
+
+        title_date = self._extract_title_date(question)
+        if title_date:
+            lines.append(f"OTSIKON PAIVAMAARA: {title_date}")
+            days = self._days_until(title_date, now)
+            if days is not None:
+                lines.append(f"OTSIKON PAIVAMAARA ON NYKYHETKESTA: {days:+d} paivaa")
+
+        return "\n".join(lines)
+
+    def _extract_title_date(self, question: str) -> str:
+        match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", question or "")
+        return match.group(1) if match else ""
+
+    def _days_until(self, date_text: str, now: datetime) -> Optional[int]:
+        try:
+            normalized = str(date_text).replace("Z", "+00:00")
+            target = datetime.fromisoformat(normalized)
+            if target.tzinfo is None:
+                target = target.replace(tzinfo=timezone.utc)
+            return (target.date() - now.date()).days
+        except Exception:
+            try:
+                target = datetime.strptime(str(date_text)[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                return (target.date() - now.date()).days
+            except Exception:
+                return None
 
     # ===========================================================================
     # Claude API -kutsu

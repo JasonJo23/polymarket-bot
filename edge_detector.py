@@ -140,6 +140,7 @@ class EdgeDetector:
             "lineup_notes": [],
             "data_quality": data_quality,
             "fetched_at":   datetime.now(timezone.utc).isoformat(),
+            "market_end_date": signal.get("end_date", ""),
             # Lisää Polymarket-konteksti
             "opponents":    market_ctx.get("opponents", ""),
             "tournament":   market_ctx.get("tournament", ""),
