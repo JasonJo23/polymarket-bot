@@ -655,15 +655,27 @@ class SignalTracker:
             status = resp.get("status", "") if isinstance(resp, dict) else getattr(resp, "status", "")
             filled_usdc, filled_tokens = self._extract_fill_amounts(resp, order_size, exec_price)
             has_fill_amounts = filled_usdc > 0 and filled_tokens > 0
+            actual_fill_price = (
+                round(filled_usdc / filled_tokens, 4)
+                if has_fill_amounts and filled_tokens > 0
+                else exec_price
+            )
 
             if status == "matched" and has_fill_amounts:
                 token_amount = round(filled_tokens, 4)
+                self._log_fill_quality(
+                    signal=signal,
+                    requested_price=exec_price,
+                    actual_price=actual_fill_price,
+                    filled_usdc=filled_usdc,
+                    filled_tokens=filled_tokens,
+                )
                 try:
                     from position_manager import add_position
                     add_position(
                         signal=signal,
                         token_id=token_id,
-                        buy_price=exec_price,
+                        buy_price=actual_fill_price,
                         amount=token_amount,
                         end_date=signal.get("end_date", "")
                     )
@@ -672,7 +684,7 @@ class SignalTracker:
                 try:
                     from notifier import notifier
                     if notifier:
-                        notifier.notify_buy(signal, exec_price, filled_usdc, status)
+                        notifier.notify_buy(signal, actual_fill_price, filled_usdc, status)
                 except Exception:
                     pass
             elif status == "delayed":
@@ -786,6 +798,37 @@ class SignalTracker:
 
         tokens = fallback_usdc / price if price > 0 else 0.0
         return fallback_usdc, tokens
+
+    def _log_fill_quality(
+        self,
+        signal: Dict[str, Any],
+        requested_price: float,
+        actual_price: float,
+        filled_usdc: float,
+        filled_tokens: float,
+    ) -> None:
+        if requested_price <= 0 or actual_price <= 0:
+            return
+
+        diff = actual_price - requested_price
+        slippage_pct = diff / requested_price
+        question = signal.get("question", "")[:45]
+        outcome = signal.get("outcome", "")
+
+        log.info(
+            f"Actual fill: requested={requested_price:.4f} actual={actual_price:.4f} "
+            f"slippage={slippage_pct:+.1%} | {filled_usdc:.2f} USDC / {filled_tokens:.4f} tokens | "
+            f"{question} | {outcome}"
+        )
+
+        bad_fill_pct = float(os.getenv("BAD_FILL_SLIPPAGE_PCT", 0.05))
+        bad_fill_abs = float(os.getenv("BAD_FILL_SLIPPAGE_ABS", 0.03))
+        if diff > 0 and (slippage_pct >= bad_fill_pct or diff >= bad_fill_abs):
+            log.warning(
+                f"BAD FILL: requested={requested_price:.4f} actual={actual_price:.4f} "
+                f"slippage={slippage_pct:+.1%} diff={diff:+.4f} | "
+                f"{question} | {outcome}"
+            )
 
     def _classify_market(self, question: str) -> str:
         q = question.lower()
