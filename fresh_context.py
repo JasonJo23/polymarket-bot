@@ -41,6 +41,16 @@ ESPN_SCOREBOARD_PATHS = {
     "nfl": "football/nfl",
 }
 
+ESPN_SOCCER_SCOREBOARD_PATHS = [
+    "soccer/uefa.champions",
+    "soccer/eng.1",
+    "soccer/fra.1",
+    "soccer/esp.1",
+    "soccer/ita.1",
+    "soccer/ger.1",
+    "soccer/uefa.europa",
+]
+
 
 class FreshContextFetcher:
     def __init__(self):
@@ -157,7 +167,11 @@ class FreshContextFetcher:
             return "mlb"
         if any(k in q for k in ["nfl", "chiefs", "eagles", "cowboys"]):
             return "nfl"
-        if any(k in q for k in ["fc ", "premier league", "la liga", "juventus", "barcelona"]):
+        if any(k in q for k in [
+            "fc ", "psg", "paris saint-germain", "paris saint germain",
+            "arsenal", "premier league", "la liga", "juventus", "barcelona",
+            "champions league",
+        ]):
             return "soccer"
         return "general"
 
@@ -206,9 +220,8 @@ class FreshContextFetcher:
                 if debug:
                     log.info(f"PandaScore ei osumaa: {endpoint} | sample={self._sample_pandascore_names(r.json())}")
             except Exception as e:
-                log.debug(f"PandaScore haku epäonnistui: {e}")
+                log.debug(f"PandaScore haku epaonnistui: {e}")
         return {}
-
     def _pandascore_endpoints(self, game: str) -> List[str]:
         endpoints = []
         if game:
@@ -342,8 +355,9 @@ class FreshContextFetcher:
 
     def _fetch_espn_scoreboard(self, question: str, teams: Dict[str, str]) -> Dict[str, Any]:
         league = self._detect_sport_feed(question)
-        path = ESPN_SCOREBOARD_PATHS.get(league)
-        if not path:
+        paths = ESPN_SOCCER_SCOREBOARD_PATHS if league == "soccer" else [ESPN_SCOREBOARD_PATHS.get(league)]
+        paths = [path for path in paths if path]
+        if not paths:
             return {}
 
         wanted = self._team_tokens(teams, question)
@@ -356,30 +370,32 @@ class FreshContextFetcher:
         lookahead = int(os.getenv("ESPN_SCOREBOARD_LOOKAHEAD_DAYS", 7))
         for offset in range(-lookback, lookahead + 1):
             day = now + timedelta(days=offset)
-            try:
-                r = self.session.get(
-                    f"{ESPN_SCOREBOARD_BASE}/{path}/scoreboard",
-                    params={
-                        "dates": day.strftime("%Y%m%d"),
-                        "limit": int(os.getenv("ESPN_SCOREBOARD_LIMIT", 100)),
-                    },
-                    timeout=8,
-                )
-                if r.status_code != 200:
-                    log.debug(f"ESPN scoreboard {league} {r.status_code}: {r.text[:120]}")
-                    continue
-                selected.extend(self._select_espn_events(r.json(), league, wanted, now))
-                if selected:
-                    break
-            except Exception as e:
-                log.debug(f"ESPN scoreboard haku epÃ¤onnistui: {e}")
+            for path in paths:
+                try:
+                    r = self.session.get(
+                        f"{ESPN_SCOREBOARD_BASE}/{path}/scoreboard",
+                        params={
+                            "dates": day.strftime("%Y%m%d"),
+                            "limit": int(os.getenv("ESPN_SCOREBOARD_LIMIT", 100)),
+                        },
+                        timeout=8,
+                    )
+                    if r.status_code != 200:
+                        log.debug(f"ESPN scoreboard {league}/{path} {r.status_code}: {r.text[:120]}")
+                        continue
+                    selected.extend(self._select_espn_events(r.json(), league, wanted, now))
+                    if selected:
+                        break
+                except Exception as e:
+                    log.debug(f"ESPN scoreboard haku epaonnistui: {e}")
+            if selected:
+                break
 
         selected.sort(key=lambda item: (item.get("_match_score", 0), item.get("begin_at", "")), reverse=True)
         if selected:
             log.info(f"ESPN scoreboard osuma: {league} -> {selected[0].get('name', '')[:60]}")
             return {"source": ["ESPN Scoreboard"], "matches": selected[:3]}
         return {}
-
     def _select_espn_events(
         self,
         data: Dict[str, Any],
@@ -569,7 +585,7 @@ class FreshContextFetcher:
         return round(min(1.0, score), 2)
 
     def _tokens(self, text: str) -> set:
-        stop = {"the", "and", "for", "with", "game", "match", "winner", "will", "vs", "bo3", "bo5"}
+        stop = {"the", "and", "for", "with", "game", "match", "winner", "will", "vs", "bo3", "bo5", "fc"}
         return {
             token
             for token in re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).split()
@@ -585,6 +601,7 @@ class FreshContextFetcher:
             "t1": {"t1"},
             "gen": {"gen", "geng"},
             "geng": {"gen", "geng"},
+            "psg": {"psg", "paris", "saint", "germain"},
         }
         expanded = set(tokens)
         for token in list(tokens):
