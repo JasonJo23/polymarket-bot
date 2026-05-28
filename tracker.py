@@ -91,11 +91,16 @@ class SignalTracker:
         self.min_positive_roi_support = int(os.getenv("MIN_POSITIVE_ROI_SUPPORT", 1))
         self.unknown_support_override = int(os.getenv("UNKNOWN_SUPPORT_OVERRIDE", 8))
         self.max_signal_price_move = float(os.getenv("MAX_SIGNAL_PRICE_MOVE", 0.10))
+        self.edge_reject_cooldown_cycles = int(os.getenv("EDGE_REJECT_COOLDOWN_CYCLES", 10))
+        self.edge_cooldown_price_move = float(os.getenv("EDGE_COOLDOWN_PRICE_MOVE", 0.03))
+        self.edge_cooldown_weight_move = float(os.getenv("EDGE_COOLDOWN_WEIGHT_MOVE", 2.0))
 
         self._executed_file   = "executed_today.json"
         self._executed_today: Set[str] = set()  # Sisältää vain market_id:t (ei outcomea)
         self._load_executed()
         self._market_cache: Dict[str, Dict] = {}
+        self._cycle_index = 0
+        self._edge_reject_cooldowns: Dict[str, Dict[str, Any]] = {}
         self._signal_state: Dict[str, Dict[str, Any]] = read_json(_SIGNAL_STATE_FILE, {"signals": {}})
         if not isinstance(self._signal_state, dict):
             self._signal_state = {"signals": {}}
@@ -219,6 +224,8 @@ class SignalTracker:
             wallet_scores:     Valmiit scorer-tulokset main.py:ltä.
                                Jos None, lasketaan tässä (fallback).
         """
+        self._cycle_index += 1
+        self._prune_edge_cooldowns()
         if not qualified_wallets:
             return []
 
@@ -508,6 +515,11 @@ class SignalTracker:
             signal["token_price"] = token_price
             signal["market_type"] = signal.get("market_type") or self._classify_market(signal.get("question", ""))
 
+            cooldown = self._edge_cooldown_reason(signal, token_price)
+            if cooldown:
+                log.info(cooldown)
+                return False
+
             # Tarkista CLOB:sta onko markkina vielä aktiivinen
             try:
                 import time as _time
@@ -539,6 +551,7 @@ class SignalTracker:
                 edge_result = _get_edge_detector().should_buy(signal, token_price)
                 signal["edge"] = edge_result
                 if not edge_result.get("approved", False):
+                    self._remember_edge_reject(signal, token_price, edge_result.get("reason", ""))
                     log.warning(f"EdgeDetector hylkäsi: {edge_result.get('reason', '')}")
                     return False
             except Exception as e:
@@ -714,6 +727,64 @@ class SignalTracker:
     # ------------------------------------------------------------------
     # Apumetodit
     # ------------------------------------------------------------------
+
+    def _cooldown_key(self, signal: Dict[str, Any]) -> str:
+        return f"{signal.get('market_id', '')}|{signal.get('outcome', '')}".lower()
+
+    def _edge_cooldown_reason(self, signal: Dict[str, Any], token_price: float) -> str:
+        if self.edge_reject_cooldown_cycles <= 0:
+            return ""
+
+        key = self._cooldown_key(signal)
+        entry = self._edge_reject_cooldowns.get(key)
+        if not entry:
+            return ""
+
+        age = self._cycle_index - int(entry.get("cycle", 0))
+        if age >= self.edge_reject_cooldown_cycles:
+            self._edge_reject_cooldowns.pop(key, None)
+            return ""
+
+        old_price = float(entry.get("price", token_price) or token_price)
+        old_weight = float(entry.get("weighted_support", 0.0) or 0.0)
+        new_weight = float(signal.get("weighted_support", 0.0) or 0.0)
+        price_move = abs(token_price - old_price)
+        weight_move = abs(new_weight - old_weight)
+
+        if price_move >= self.edge_cooldown_price_move or weight_move >= self.edge_cooldown_weight_move:
+            self._edge_reject_cooldowns.pop(key, None)
+            log.info(
+                f"Edge cooldown ohitettu: {signal.get('question', '')[:40]} | "
+                f"hinta {old_price:.3f}->{token_price:.3f}, w {old_weight:.1f}->{new_weight:.1f}"
+            )
+            return ""
+
+        remaining = self.edge_reject_cooldown_cycles - age
+        return (
+            f"Edge cooldown: {signal.get('question', '')[:40]} | {signal.get('outcome', '')} "
+            f"ohitetaan {remaining} sykliä (ei hinta/tuki-muutosta)"
+        )
+
+    def _remember_edge_reject(self, signal: Dict[str, Any], token_price: float, reason: str) -> None:
+        if self.edge_reject_cooldown_cycles <= 0:
+            return
+        self._edge_reject_cooldowns[self._cooldown_key(signal)] = {
+            "cycle": self._cycle_index,
+            "price": float(token_price or 0.0),
+            "weighted_support": float(signal.get("weighted_support", 0.0) or 0.0),
+            "support_count": int(signal.get("support_count", 0) or 0),
+            "reason": reason,
+        }
+
+    def _prune_edge_cooldowns(self) -> None:
+        if not self._edge_reject_cooldowns:
+            return
+        expired = [
+            key for key, entry in self._edge_reject_cooldowns.items()
+            if self._cycle_index - int(entry.get("cycle", 0)) >= self.edge_reject_cooldown_cycles
+        ]
+        for key in expired:
+            self._edge_reject_cooldowns.pop(key, None)
 
     def _calculate_order_size(self, signal: Dict[str, Any]) -> float:
         """Skaalaa panos markkinatyypin, edgen ja confidence-tason mukaan."""
