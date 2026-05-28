@@ -36,6 +36,7 @@ CLOB_BASE  = "https://clob.polymarket.com"
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 _SIGNAL_STATE_FILE = "signal_state.json"
 _SIGNAL_SNAPSHOTS_FILE = "signal_snapshots.jsonl"
+_PENDING_ORDERS_FILE = "pending_orders.json"
 
 _edge_detector_instance = None
 
@@ -101,6 +102,7 @@ class SignalTracker:
         self._market_cache: Dict[str, Dict] = {}
         self._cycle_index = 0
         self._edge_reject_cooldowns: Dict[str, Dict[str, Any]] = {}
+        self._pending_orders = self._load_pending_orders()
         self._signal_state: Dict[str, Dict[str, Any]] = read_json(_SIGNAL_STATE_FILE, {"signals": {}})
         if not isinstance(self._signal_state, dict):
             self._signal_state = {"signals": {}}
@@ -226,6 +228,7 @@ class SignalTracker:
         """
         self._cycle_index += 1
         self._prune_edge_cooldowns()
+        self.reconcile_pending_orders()
         if not qualified_wallets:
             return []
 
@@ -701,6 +704,13 @@ class SignalTracker:
                 except Exception:
                     pass
             elif status == "delayed":
+                self._remember_pending_order(
+                    resp=resp,
+                    signal=signal,
+                    token_id=token_id,
+                    requested_price=exec_price,
+                    order_size=order_size,
+                )
                 log.warning("Order delayed ilman varmaa fill-määrää — positiota ei lisätä vielä")
                 try:
                     from notifier import notifier
@@ -727,6 +737,205 @@ class SignalTracker:
     # ------------------------------------------------------------------
     # Apumetodit
     # ------------------------------------------------------------------
+
+    def _create_clob_client(self):
+        from py_clob_client_v2 import ClobClient, ApiCreds
+
+        creds = ApiCreds(
+            api_key=os.getenv("CLOB_API_KEY"),
+            api_secret=os.getenv("CLOB_API_SECRET"),
+            api_passphrase=os.getenv("CLOB_PASSPHRASE"),
+        )
+        return ClobClient(
+            host=CLOB_BASE,
+            chain_id=137,
+            key=os.getenv("PRIVATE_KEY"),
+            creds=creds,
+            signature_type=2,
+            funder=os.getenv("PROXY_WALLET_ADDRESS"),
+        )
+
+    def _load_pending_orders(self) -> List[Dict[str, Any]]:
+        data = read_json(_PENDING_ORDERS_FILE, {"orders": []})
+        orders = data.get("orders", []) if isinstance(data, dict) else []
+        return orders if isinstance(orders, list) else []
+
+    def _save_pending_orders(self) -> None:
+        try:
+            write_json(_PENDING_ORDERS_FILE, {"orders": self._pending_orders}, indent=2)
+        except Exception as e:
+            log.warning(f"Pending-orderien tallennus epaonnistui: {e}")
+
+    def _pending_signal_snapshot(self, signal: Dict[str, Any]) -> Dict[str, Any]:
+        keys = [
+            "market_id", "question", "outcome", "end_date", "market_type",
+            "support_count", "weighted_support", "positive_roi_support",
+            "category_positive_support", "active_support", "reliable_support",
+            "unknown_support", "total_size_usdc", "token_price", "edge",
+            "intelligence",
+        ]
+        return {key: signal.get(key) for key in keys if key in signal}
+
+    def _remember_pending_order(
+        self,
+        resp: Any,
+        signal: Dict[str, Any],
+        token_id: str,
+        requested_price: float,
+        order_size: float,
+    ) -> None:
+        if not isinstance(resp, dict):
+            return
+
+        order_id = resp.get("orderID") or resp.get("order_id") or resp.get("id")
+        if not order_id:
+            log.warning("Delayed order ilman orderID:tä - ei voida seurata")
+            return
+
+        if any(o.get("order_id") == order_id for o in self._pending_orders):
+            return
+
+        self._pending_orders.append({
+            "order_id": order_id,
+            "token_id": token_id,
+            "signal": self._pending_signal_snapshot(signal),
+            "requested_price": requested_price,
+            "order_size": order_size,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "attempts": 0,
+            "last_status": "delayed",
+        })
+        self._save_pending_orders()
+        log.warning(f"Pending order tallennettu seurantaan: {order_id[:12]} | {signal.get('question', '')[:45]}")
+
+    def reconcile_pending_orders(self) -> None:
+        if self.dry_run or not self._pending_orders or not os.getenv("CLOB_API_KEY"):
+            return
+
+        try:
+            client = self._create_clob_client()
+        except Exception as e:
+            log.debug(f"Pending-order clientin luonti epaonnistui: {e}")
+            return
+
+        keep: List[Dict[str, Any]] = []
+        changed = False
+        max_attempts = int(os.getenv("PENDING_ORDER_MAX_ATTEMPTS", 24))
+
+        for pending in self._pending_orders:
+            pending["attempts"] = int(pending.get("attempts", 0)) + 1
+            order_id = pending.get("order_id", "")
+            try:
+                order = self._fetch_order_status(client, order_id)
+            except Exception as e:
+                log.debug(f"Pending order {order_id[:12]} statushaku epaonnistui: {e}")
+                order = None
+
+            if not order:
+                if pending["attempts"] <= max_attempts:
+                    keep.append(pending)
+                else:
+                    log.warning(f"Pending order vanheni ilman statusta: {order_id[:12]}")
+                    changed = True
+                continue
+
+            status = str(order.get("status", "") or order.get("state", "")).lower()
+            pending["last_status"] = status or pending.get("last_status", "")
+            filled_usdc, filled_tokens = self._extract_fill_amounts(
+                order,
+                float(pending.get("order_size", 0) or 0),
+                float(pending.get("requested_price", 0) or 0),
+            )
+
+            if (
+                filled_usdc > 0
+                and filled_tokens > 0
+                and status not in ("delayed", "open", "live", "active", "pending")
+            ):
+                self._add_pending_position(pending, order, filled_usdc, filled_tokens)
+                changed = True
+                continue
+
+            if status in ("cancelled", "canceled", "expired", "failed"):
+                log.warning(f"Pending order ei tayttynyt: {order_id[:12]} status={status}")
+                changed = True
+                continue
+
+            keep.append(pending)
+
+        if changed or len(keep) != len(self._pending_orders):
+            self._pending_orders = keep
+            self._save_pending_orders()
+        else:
+            self._pending_orders = keep
+
+    def _fetch_order_status(self, client: Any, order_id: str) -> Optional[Dict[str, Any]]:
+        if not order_id:
+            return None
+
+        if hasattr(client, "get_order"):
+            try:
+                order = client.get_order(order_id)
+                if isinstance(order, dict):
+                    return order
+            except Exception:
+                pass
+
+        if hasattr(client, "get_open_orders"):
+            try:
+                from py_clob_client_v2.clob_types import OpenOrderParams
+                orders = client.get_open_orders(OpenOrderParams(id=order_id), only_first_page=True)
+                if orders:
+                    first = orders[0]
+                    return first if isinstance(first, dict) else getattr(first, "__dict__", None)
+            except Exception:
+                pass
+
+        return None
+
+    def _add_pending_position(
+        self,
+        pending: Dict[str, Any],
+        order: Dict[str, Any],
+        filled_usdc: float,
+        filled_tokens: float,
+    ) -> None:
+        signal = pending.get("signal", {}) if isinstance(pending.get("signal"), dict) else {}
+        token_id = pending.get("token_id", "")
+        actual_price = round(filled_usdc / filled_tokens, 4) if filled_tokens > 0 else pending.get("requested_price", 0)
+        token_amount = round(filled_tokens, 4)
+
+        self._log_fill_quality(
+            signal=signal,
+            requested_price=float(pending.get("requested_price", 0) or 0),
+            actual_price=actual_price,
+            filled_usdc=filled_usdc,
+            filled_tokens=filled_tokens,
+        )
+
+        try:
+            from position_manager import add_position
+            add_position(
+                signal=signal,
+                token_id=token_id,
+                buy_price=actual_price,
+                amount=token_amount,
+                end_date=signal.get("end_date", ""),
+            )
+            log.info(
+                f"Pending order matched -> positio lisatty: {signal.get('question', '')[:45]} "
+                f"| {signal.get('outcome', '')} @ {actual_price}"
+            )
+        except Exception as e:
+            log.warning(f"Pending-position lisays epaonnistui: {e}")
+            return
+
+        try:
+            from notifier import notifier
+            if notifier:
+                notifier.notify_buy(signal, actual_price, filled_usdc, str(order.get("status", "matched")))
+        except Exception:
+            pass
 
     def _cooldown_key(self, signal: Dict[str, Any]) -> str:
         return f"{signal.get('market_id', '')}|{signal.get('outcome', '')}".lower()
@@ -863,6 +1072,22 @@ class SignalTracker:
         taking = _num("takingAmount")
         if making > 0 and taking > 0:
             return making, taking
+
+        matched_tokens = 0.0
+        for key in ("size_matched", "sizeMatched", "matched_size", "filledSize", "filled_size"):
+            matched_tokens = _num(key)
+            if matched_tokens > 0:
+                break
+
+        order_price = price
+        for key in ("avgPrice", "avg_price", "price", "matched_price"):
+            val = _num(key)
+            if val > 0:
+                order_price = val
+                break
+
+        if matched_tokens > 0 and order_price > 0:
+            return matched_tokens * order_price, matched_tokens
 
         if str(resp.get("status", "")).lower() == "delayed":
             return 0.0, 0.0

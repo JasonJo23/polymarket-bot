@@ -16,6 +16,7 @@ predictions_log.json
 signal_tracker.txt
 signal_state.json
 signal_snapshots.jsonl
+pending_orders.json
 
 # Local scratch/debug files
 debug*.py
