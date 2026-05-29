@@ -250,6 +250,11 @@ Vastaa VAIN JSON, ei muuta tekstiä:
             days = self._days_until(end_date, now)
             if days is not None:
                 lines.append(f"END_DATE ON NYKYHETKESTA: {days:+d} paivaa")
+                if days >= 0:
+                    lines.append(
+                        "MARKKINA EI OLE VIELA END_DATE:N PERUSTEELLA OHI. "
+                        "Ala paattele kauden/finaalin jo ratkenneen pelkan kuukauden tai vuoden perusteella."
+                    )
 
         title_date = self._extract_title_date(question)
         if title_date:
@@ -257,6 +262,12 @@ Vastaa VAIN JSON, ei muuta tekstiä:
             days = self._days_until(title_date, now)
             if days is not None:
                 lines.append(f"OTSIKON PAIVAMAARA ON NYKYHETKESTA: {days:+d} paivaa")
+
+        if any(k in (question or "").lower() for k in ["champions league", "final", "win the 2025", "win the 2026"]):
+            lines.append(
+                "KAUSI-/MESTARUUSMARKKINA: kayta tarkkaa paivaa. "
+                "Jos tuore tulosdata ei sano etta finaali on final/finished, ala merkitse kautta ohi."
+            )
 
         return "\n".join(lines)
 
