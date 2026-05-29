@@ -452,9 +452,14 @@ def check_and_exit_positions():
                 if notifier:
                     notifier.notify_sell(question, pnl_pct, reason)
                 continue
+            sell_status = sell_result.get("status", "unknown")
+            if sell_status in ("live", "open", "open_sell_order") and not pos.get("sell_order_notified"):
+                if notifier:
+                    notifier.notify_sell_order_open(question, pnl_pct, reason, sell_status)
+                pos["sell_order_notified"] = True
             log.info(
                 f"Positio pidetaan seurannassa: {question[:35]} | "
-                f"sell_status={sell_result.get('status', 'unknown')}"
+                f"sell_status={sell_status}"
             )
 
         remaining.append(pos)

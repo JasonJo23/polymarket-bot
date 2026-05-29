@@ -1133,6 +1133,18 @@ class SignalTracker:
                 f"slippage={slippage_pct:+.1%} diff={diff:+.4f} | "
                 f"{question} | {outcome}"
             )
+            try:
+                from notifier import notifier
+                if notifier:
+                    notifier.notify_bad_fill(
+                        signal=signal,
+                        requested_price=requested_price,
+                        actual_price=actual_price,
+                        slippage_pct=slippage_pct,
+                        size=filled_usdc,
+                    )
+            except Exception:
+                pass
 
     def _classify_market(self, question: str) -> str:
         q = question.lower()
