@@ -49,8 +49,9 @@ def _get_edge_detector():
     return _edge_detector_instance
 
 
-def get_usdc_balance_v2() -> float:
-    """Hakee USDC-saldon suoraan REST-kutsulla (v2 API)."""
+def get_usdc_balance_v2(allow_fallback: bool = False) -> float:
+    """Hakee vapaan USDC-saldon CLOBista."""
+    fallback = float(os.getenv("CURRENT_BANKROLL_USDC", 100.0))
     try:
         from py_clob_client_v2 import ClobClient, ApiCreds
         creds = ApiCreds(
@@ -74,10 +75,16 @@ def get_usdc_balance_v2() -> float:
             timeout=8
         )
         if r.status_code == 200:
-            return float(r.json().get("balance", 0)) / 1e6
+            return float(r.json().get("balance", 0) or 0) / 1e6
+        log.warning(f"USDC-saldon haku epäonnistui: HTTP {r.status_code} {r.text[:160]}")
     except Exception as e:
-        log.debug(f"Saldon haku v2 epäonnistui: {e}")
-    return float(os.getenv("CURRENT_BANKROLL_USDC", 100.0))
+        log.warning(f"USDC-saldon haku epäonnistui: {e}")
+    if allow_fallback:
+        log.warning(f"Käytetään fallback-kassaa CURRENT_BANKROLL_USDC={fallback:.2f}")
+        return fallback
+
+    log.error("Live-USDC saldoa ei saatu haettua - palautetaan 0.00, jotta ostot pysähtyvät")
+    return 0.0
 
 
 class SignalTracker:
