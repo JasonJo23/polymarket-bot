@@ -98,7 +98,7 @@ def _sell_position_v2(
     amount: float,
     current_price: float,
     reason: str
-) -> bool:
+) -> Dict[str, Any]:
     """
     Myy positio py_clob_client_v2:lla.
     Käyttää GTC limit-orderia 2% alle nykyhinnan.
@@ -129,7 +129,7 @@ def _sell_position_v2(
         if actual_balance is not None:
             if actual_balance <= 0.0001:
                 log.warning(f"Positio puuttuu walletista — poistetaan seurannasta: {token_id[:16]}")
-                return True
+                return {"closed": True, "status": "missing_balance", "resp": None}
             if actual_balance < amount:
                 log.warning(
                     f"Paikallinen positio suurempi kuin wallet-saldo: "
@@ -165,10 +165,26 @@ def _sell_position_v2(
 
         if resp:
             log.info(f"✅ Myynti tehty @ {sell_price} | Syy: {reason} | {resp}")
-            return True
+            status = str(resp.get("status", "") if isinstance(resp, dict) else getattr(resp, "status", "")).lower()
+            filled_usdc, filled_tokens = _extract_sell_fill(resp)
+            if status in ("matched", "filled", "complete", "completed") and filled_tokens > 0:
+                log.info(
+                    f"Myynti fill vahvistettu: {filled_usdc:.2f} USDC / "
+                    f"{filled_tokens:.4f} tokens | status={status}"
+                )
+                return {
+                    "closed": True,
+                    "status": status,
+                    "resp": resp,
+                    "filled_usdc": filled_usdc,
+                    "filled_tokens": filled_tokens,
+                }
+
+            log.warning(f"Myyntiorderi jäi auki ({status or 'unknown'}) — positiota ei poisteta vielä")
+            return {"closed": False, "status": status, "resp": resp}
         else:
             log.warning(f"⚠️ Myynti epäonnistui: {resp}")
-            return False
+            return {"closed": False, "status": "failed", "resp": resp}
 
     except Exception as e:
         err = str(e)
@@ -176,7 +192,7 @@ def _sell_position_v2(
             log.warning(f"Polymarket ei valmis myyntiin (425) — yritetään myöhemmin.")
         else:
             log.error(f"Myyntivirhe: {e}")
-        return False
+        return {"closed": False, "status": "error", "resp": None}
 
 
 def _get_token_balance_v2(client, token_id: str) -> Optional[float]:
@@ -201,6 +217,25 @@ def _get_token_balance_v2(client, token_id: str) -> Optional[float]:
     except Exception as e:
         log.debug(f"Token-saldon haku epäonnistui: {e}")
         return None
+
+
+def _extract_sell_fill(resp: Any) -> Tuple[float, float]:
+    """Palauttaa myynnin USDC- ja token-fill maarat CLOB-responsesta."""
+    if not isinstance(resp, dict):
+        return 0.0, 0.0
+
+    def _num(key: str) -> float:
+        try:
+            return float(resp.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    taking = _num("takingAmount")
+    making = _num("makingAmount")
+    if taking > 0 and making > 0:
+        return taking, making
+
+    return 0.0, 0.0
 
 
 def _evaluate_sports_position(position: Dict) -> Tuple[bool, str]:
@@ -368,13 +403,17 @@ def check_and_exit_positions():
             should_sell, reason = _evaluate_macro_position(pos)
 
         if should_sell:
-            success = _sell_position_v2(token_id, amount, current_price, reason)
-            if success:
+            sell_result = _sell_position_v2(token_id, amount, current_price, reason)
+            if sell_result.get("closed"):
                 sold_count += 1
                 log.info(f"💰 Myyty: {question[:35]} | P&L: {pnl_pct:+.1%} | {reason}")
                 if notifier:
                     notifier.notify_sell(question, pnl_pct, reason)
                 continue
+            log.info(
+                f"Positio pidetaan seurannassa: {question[:35]} | "
+                f"sell_status={sell_result.get('status', 'unknown')}"
+            )
 
         remaining.append(pos)
 
