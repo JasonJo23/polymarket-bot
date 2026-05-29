@@ -108,7 +108,6 @@ def _sell_position_v2(
             ClobClient, ApiCreds, OrderArgs,
             OrderType, Side, PartialCreateOrderOptions
         )
-
         sell_price = round(max(0.01, current_price * 0.98), 3)
 
         creds = ApiCreds(
@@ -136,6 +135,23 @@ def _sell_position_v2(
                     f"{amount:.4f} → {actual_balance:.4f}"
                 )
                 amount = actual_balance
+
+        open_sell_size = _get_open_sell_order_size(client, token_id)
+        if open_sell_size >= amount * 0.98:
+            log.info(
+                f"Avoin myyntiorderi jo kattaa position: "
+                f"{open_sell_size:.4f}/{amount:.4f} tokens"
+            )
+            return {"closed": False, "status": "open_sell_order", "resp": None}
+        if open_sell_size > 0:
+            remaining_amount = max(0.0, amount - open_sell_size)
+            if remaining_amount <= 0.0001:
+                return {"closed": False, "status": "open_sell_order", "resp": None}
+            log.info(
+                f"Avoin myyntiorderi huomioitu: {open_sell_size:.4f} tokens, "
+                f"myydään jäljellä {remaining_amount:.4f}"
+            )
+            amount = remaining_amount
 
         # Hae tick size
         tick_size = "0.01"
@@ -214,6 +230,35 @@ def _get_token_balance_v2(client, token_id: str) -> Optional[float]:
     except Exception as e:
         log.debug(f"Token-saldon haku epäonnistui: {e}")
         return None
+
+
+def _get_open_sell_order_size(client, token_id: str) -> float:
+    """Palauttaa avoimissa sell-ordereissa lukitun token-maaran."""
+    try:
+        from py_clob_client_v2.clob_types import OpenOrderParams
+
+        orders = client.get_open_orders(
+            OpenOrderParams(asset_id=token_id),
+            only_first_page=True,
+        )
+    except Exception as e:
+        log.debug(f"Avoimien orderien haku epäonnistui: {e}")
+        return 0.0
+
+    total = 0.0
+    for order in orders or []:
+        side = str(order.get("side", "")).upper()
+        if side and side != "SELL":
+            continue
+        for key in ("remaining_size", "original_size", "size"):
+            try:
+                value = float(order.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                total += value
+                break
+    return total
 
 
 def _extract_sell_fill(resp: Any) -> Tuple[float, float]:

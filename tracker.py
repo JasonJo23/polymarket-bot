@@ -711,7 +711,7 @@ class SignalTracker:
                         notifier.notify_buy(signal, actual_fill_price, filled_usdc, status)
                 except Exception:
                     pass
-            elif status == "delayed":
+            elif status in ("delayed", "live"):
                 self._remember_pending_order(
                     resp=resp,
                     signal=signal,
