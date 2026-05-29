@@ -198,22 +198,19 @@ def _sell_position_v2(
 def _get_token_balance_v2(client, token_id: str) -> Optional[float]:
     """Hakee todellisen conditional-token saldon ennen myyntiä."""
     try:
-        headers = client._create_l2_headers("GET", "/balance-allowance", None)
-        r = requests.get(
-            f"{CLOB_BASE}/balance-allowance",
-            headers=headers,
-            params={
-                "asset_type": "CONDITIONAL",
-                "token_id": token_id,
-                "signature_type": 2,
-            },
-            timeout=8,
+        from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
+
+        params = BalanceAllowanceParams(
+            asset_type=AssetType.CONDITIONAL,
+            token_id=token_id,
         )
-        if r.status_code != 200:
-            log.debug(f"Token-saldon haku epäonnistui: {r.status_code} {r.text[:120]}")
-            return None
-        raw = r.json().get("balance", 0)
-        return float(raw) / 1e6
+        resp = client.get_balance_allowance(params)
+        raw = float(resp.get("balance", 0) or 0)
+        if raw <= 0:
+            client.update_balance_allowance(params)
+            resp = client.get_balance_allowance(params)
+            raw = float(resp.get("balance", 0) or 0)
+        return raw / 1e6
     except Exception as e:
         log.debug(f"Token-saldon haku epäonnistui: {e}")
         return None

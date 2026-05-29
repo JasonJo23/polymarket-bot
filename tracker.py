@@ -54,6 +54,7 @@ def get_usdc_balance_v2(allow_fallback: bool = False) -> float:
     fallback = float(os.getenv("CURRENT_BANKROLL_USDC", 100.0))
     try:
         from py_clob_client_v2 import ClobClient, ApiCreds
+        from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
         creds = ApiCreds(
             api_key=os.getenv("CLOB_API_KEY", ""),
             api_secret=os.getenv("CLOB_API_SECRET", ""),
@@ -67,16 +68,16 @@ def get_usdc_balance_v2(allow_fallback: bool = False) -> float:
             signature_type=2,
             funder=os.getenv("PROXY_WALLET_ADDRESS")
         )
-        headers = client._create_l2_headers("GET", "/balance-allowance", None)
-        r = requests.get(
-            f"{CLOB_BASE}/balance-allowance",
-            headers=headers,
-            params={"asset_type": "COLLATERAL", "signature_type": 2},
-            timeout=8
-        )
-        if r.status_code == 200:
-            return float(r.json().get("balance", 0) or 0) / 1e6
-        log.warning(f"USDC-saldon haku epäonnistui: HTTP {r.status_code} {r.text[:160]}")
+        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        resp = client.get_balance_allowance(params)
+        balance = float(resp.get("balance", 0) or 0) / 1e6
+
+        if balance <= 0:
+            client.update_balance_allowance(params)
+            resp = client.get_balance_allowance(params)
+            balance = float(resp.get("balance", 0) or 0) / 1e6
+
+        return balance
     except Exception as e:
         log.warning(f"USDC-saldon haku epäonnistui: {e}")
     if allow_fallback:
