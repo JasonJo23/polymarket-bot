@@ -25,6 +25,8 @@ except Exception:
     notifier = None
 
 CLOB_BASE = "https://clob.polymarket.com"
+POSITION_DUST_TOKEN_THRESHOLD = float(os.getenv("POSITION_DUST_TOKEN_THRESHOLD", "0.01"))
+POSITION_DUST_USDC_THRESHOLD = float(os.getenv("POSITION_DUST_USDC_THRESHOLD", "0.25"))
 
 SPORTS_KEYWORDS = [
     "vs.", "vs ", "game 1", "game 2", "game 3", "bo3", "bo5",
@@ -126,9 +128,9 @@ def _sell_position_v2(
 
         actual_balance = _get_token_balance_v2(client, token_id)
         if actual_balance is not None:
-            if actual_balance <= 0.0001:
+            if _is_dust_position(actual_balance, current_price):
                 log.warning(f"Positio puuttuu walletista — poistetaan seurannasta: {token_id[:16]}")
-                return {"closed": True, "status": "missing_balance", "resp": None}
+                return {"closed": True, "status": "dust_balance", "resp": None}
             if actual_balance < amount:
                 log.warning(
                     f"Paikallinen positio suurempi kuin wallet-saldo: "
@@ -145,13 +147,24 @@ def _sell_position_v2(
             return {"closed": False, "status": "open_sell_order", "resp": None}
         if open_sell_size > 0:
             remaining_amount = max(0.0, amount - open_sell_size)
-            if remaining_amount <= 0.0001:
-                return {"closed": False, "status": "open_sell_order", "resp": None}
+            if _is_dust_position(remaining_amount, current_price):
+                log.info(
+                    f"Avoimen myyntiorderin jalkeen jaljella vain dust "
+                    f"{remaining_amount:.4f} tokenia - poistetaan seurannasta"
+                )
+                return {"closed": True, "status": "dust_remaining", "resp": None}
             log.info(
                 f"Avoin myyntiorderi huomioitu: {open_sell_size:.4f} tokens, "
                 f"myydään jäljellä {remaining_amount:.4f}"
             )
             amount = remaining_amount
+
+        if _is_dust_position(amount, current_price):
+            log.info(
+                f"Myyntimaara on dust {amount:.4f} tokenia "
+                f"(~{amount * current_price:.2f} USDC) - poistetaan seurannasta"
+            )
+            return {"closed": True, "status": "dust_amount", "resp": None}
 
         # Hae tick size
         tick_size = "0.01"
@@ -230,6 +243,22 @@ def _get_token_balance_v2(client, token_id: str) -> Optional[float]:
     except Exception as e:
         log.debug(f"Token-saldon haku epäonnistui: {e}")
         return None
+
+
+def _is_dust_position(amount: float, price: float) -> bool:
+    """True when a remaining token balance is too small to sell reliably."""
+    try:
+        amount = float(amount or 0)
+        price = float(price or 0)
+    except (TypeError, ValueError):
+        return False
+    if amount <= 0:
+        return True
+    if amount <= POSITION_DUST_TOKEN_THRESHOLD:
+        return True
+    if price > 0 and amount * price <= POSITION_DUST_USDC_THRESHOLD:
+        return True
+    return False
 
 
 def _get_open_sell_order_size(client, token_id: str) -> float:
@@ -447,6 +476,13 @@ def check_and_exit_positions():
         if should_sell:
             sell_result = _sell_position_v2(token_id, amount, current_price, reason)
             if sell_result.get("closed"):
+                sell_status = sell_result.get("status", "unknown")
+                if sell_status in ("dust_balance", "dust_remaining", "dust_amount", "missing_balance"):
+                    log.info(
+                        f"Positio poistettu seurannasta: {question[:35]} | "
+                        f"status={sell_status}"
+                    )
+                    continue
                 sold_count += 1
                 log.info(f"💰 Myyty: {question[:35]} | P&L: {pnl_pct:+.1%} | {reason}")
                 if notifier:
