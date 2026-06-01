@@ -19,7 +19,7 @@ import os
 import re
 import logging
 import requests
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 from datetime import datetime, timezone
 
 log = logging.getLogger("Scout.MarketContext")
@@ -206,20 +206,10 @@ def _best_question_match(question: str, markets: list, min_score: float = None) 
 def _extract_opponents(question: str, gamma_data: Dict) -> str:
     """Erottaa vastustajat kysymyksestä tai Gamma-datasta."""
     # Suora vs-muoto kysymyksessä
-    cleaned_question = re.sub(
-        r"^(?:lol|dota\s*2?|cs2|csgo|valorant|nba|mlb|nhl|nfl|wnba|soccer|tennis):\s*",
-        "",
-        question or "",
-        flags=re.IGNORECASE,
-    ).strip()
-    vs_match = re.search(
-        r"(.+?)\s+vs\.?\s+(.+?)(?:\s*(?:\(|\||\s+-\s+|:)|$)",
-        cleaned_question,
-        re.IGNORECASE,
-    )
+    cleaned_question = _strip_market_prefix(question or "")
+    vs_match = _parse_vs_opponents(cleaned_question)
     if vs_match:
-        home = _clean_opponent_name(vs_match.group(1))
-        away = _clean_opponent_name(vs_match.group(2))
+        home, away = vs_match
         return f"{home} vs {away}"
 
     # Gamma description saattaa sisältää vastustajan
@@ -229,6 +219,36 @@ def _extract_opponents(question: str, gamma_data: Dict) -> str:
         return f"{vs_match2.group(1).strip()} vs {vs_match2.group(2).strip()}"
 
     return ""
+
+
+def _strip_market_prefix(question: str) -> str:
+    return re.sub(
+        r"^(?:lol|league of legends|dota\s*2?|cs2|csgo|valorant|nba|mlb|nhl|nfl|wnba|soccer|tennis):\s*",
+        "",
+        question or "",
+        flags=re.IGNORECASE,
+    ).strip()
+
+
+def _parse_vs_opponents(text: str) -> Optional[Tuple[str, str]]:
+    match = re.search(r"(.+?)\s+vs\.?\s+(.+)$", text or "", re.IGNORECASE)
+    if not match:
+        return None
+
+    home = _clean_opponent_name(match.group(1))
+    away = _clean_opponent_name(match.group(2))
+    away = re.split(r"\s+(?:-|–|—|\||:)\s+|\s+\(", away, maxsplit=1)[0]
+    away = re.sub(
+        r"\s+(?:game|map)\s+\d+\s+winner.*$|\s+winner.*$|\s+moneyline.*$|\s+spread.*$",
+        "",
+        away,
+        flags=re.IGNORECASE,
+    )
+    away = _clean_opponent_name(away)
+
+    if not home or not away:
+        return None
+    return home, away
 
 
 def _clean_opponent_name(name: str) -> str:

@@ -167,35 +167,6 @@ class SignalTracker:
             log.debug(f"Ostomuistin lataus epäonnistui: {e}")
 
     def _save_executed(self):
-        """Tallentaa ostetut markkinat uudella formaatilla (dict + timestamp)."""
-        import json as _json
-        try:
-            # Lataa vanhat merkinnät
-            try:
-                with open(self._executed_file, "r") as f:
-                    data = _json.load(f)
-                existing = data.get("signals", [])
-                # Konvertoi vanha formaatti uuteen
-                if existing and isinstance(existing[0], str):
-                    existing = []
-            except Exception:
-                existing = []
-
-            existing_ids = {s.get("market_id") for s in existing if isinstance(s, dict)}
-
-            for market_id in self._executed_today:
-                if market_id not in existing_ids:
-                    existing.append({
-                        "market_id": market_id,
-                        "bought_at": datetime.now().isoformat()
-                    })
-
-            with open(self._executed_file, "w") as f:
-                _json.dump({"signals": existing}, f)
-        except Exception as e:
-            log.warning(f"Signaalien tallennus epäonnistui: {e}")
-
-    def _save_executed(self):
         """Tallentaa ostetut markkinat atomisesti."""
         try:
             data = read_json(self._executed_file, {"signals": []})

@@ -6,11 +6,11 @@ current market holders. The file is runtime state and intentionally ignored by
 Git.
 """
 
-import json
 import logging
 import os
 from datetime import datetime, timezone
 from typing import Dict, List
+
 from state_store import read_json, write_json
 
 log = logging.getLogger("Scout.WalletUniverse")
@@ -20,37 +20,6 @@ UNIVERSE_FILE = "known_wallets.json"
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _load() -> Dict[str, Dict]:
-    try:
-        with open(UNIVERSE_FILE, "r") as f:
-            data = json.load(f)
-        wallets = data.get("wallets", {}) if isinstance(data, dict) else {}
-        return wallets if isinstance(wallets, dict) else {}
-    except FileNotFoundError:
-        return {}
-    except Exception as e:
-        log.debug(f"Known wallet lataus epäonnistui: {e}")
-        return {}
-
-
-def _save(wallets: Dict[str, Dict]):
-    try:
-        max_wallets = int(os.getenv("KNOWN_WALLET_MAX_STORED", 1000))
-        ranked = sorted(
-            wallets.items(),
-            key=lambda item: (
-                float(item[1].get("weight", 0.0) or 0.0),
-                int(item[1].get("trades_14d", 0) or 0),
-                item[1].get("last_seen", ""),
-            ),
-            reverse=True,
-        )[:max_wallets]
-        with open(UNIVERSE_FILE, "w") as f:
-            json.dump({"wallets": dict(ranked), "updated_at": _now()}, f, indent=2)
-    except Exception as e:
-        log.debug(f"Known wallet tallennus epäonnistui: {e}")
 
 
 def _load() -> Dict[str, Dict]:
@@ -73,7 +42,7 @@ def _save(wallets: Dict[str, Dict]):
         )[:max_wallets]
         write_json(UNIVERSE_FILE, {"wallets": dict(ranked), "updated_at": _now()}, indent=2)
     except Exception as e:
-        log.debug(f"Known wallet tallennus epäonnistui: {e}")
+        log.debug(f"Known wallet tallennus epaonnistui: {e}")
 
 
 def add_discovered_wallets(wallets: List[str], source: str):
@@ -137,7 +106,7 @@ def update_from_scores(scores: Dict[str, Dict]):
         added_or_updated += 1
 
     _save(known)
-    log.info(f"Known wallet universe päivitetty: {added_or_updated} walletia")
+    log.info(f"Known wallet universe paivitetty: {added_or_updated} walletia")
 
 
 def get_candidate_wallets(limit: int = None) -> List[str]:
@@ -169,5 +138,5 @@ def get_candidate_wallets(limit: int = None) -> List[str]:
     candidates.sort(key=lambda item: (item[1], item[2], item[3], item[4]), reverse=True)
     result = [addr for addr, *_ in candidates[:limit]]
     if result:
-        log.info(f"Known wallet universe: {len(result)} lisäwalletia hakuun")
+        log.info(f"Known wallet universe: {len(result)} lisawalletia hakuun")
     return result

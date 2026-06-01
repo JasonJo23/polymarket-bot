@@ -253,7 +253,7 @@ class PolymarketFetcher:
         min_spike_wallets = int(os.getenv("MIN_SPIKE_WALLETS", 10))
         cutoff_ts    = int((datetime.now(timezone.utc) - timedelta(hours=spike_hours)).timestamp())
 
-        wallets_spike: set = set()
+        wallets_spike: Dict[str, Dict[str, float]] = {}
         wallets_holders: set = set()
 
         for market in markets:
@@ -266,7 +266,11 @@ class PolymarketFetcher:
                 side = str(trade.get("side", "")).upper()
                 addr = self._extract_address(trade)
                 if side == "BUY" and addr:
-                    wallets_spike.add(addr)
+                    stats = wallets_spike.setdefault(addr, {"buy_count": 0, "total_size": 0.0, "max_size": 0.0})
+                    size = self._extract_trade_size(trade)
+                    stats["buy_count"] += 1
+                    stats["total_size"] += size
+                    stats["max_size"] = max(stats["max_size"], size)
 
             # Hae top-holderit fallbackiksi ja scoringin historian lähteeksi.
             data = self._get(f"{DATA_BASE}/holders", {
@@ -283,17 +287,19 @@ class PolymarketFetcher:
             time.sleep(self.request_delay)
 
         # Yhdistä: volyymi-piikki ensin, täydennä holdereilla jos liian vähän
-        combined = list(wallets_spike)
-        spike_count = len(wallets_spike)
+        raw_spike_count = len(wallets_spike)
+        spike_wallets = self._rank_spike_wallets(wallets_spike)
+        combined = list(spike_wallets)
+        spike_count = len(spike_wallets)
 
-        if spike_count < min_spike_wallets:
+        if raw_spike_count < min_spike_wallets:
             # Lisää top-holderit jotka eivät ole jo listalla
             for w in wallets_holders:
                 if w not in wallets_spike:
                     combined.append(w)
 
         log.info(
-            f"Lompakkohaku: {spike_count} volyymi-piikki ({spike_hours}h) + "
+            f"Lompakkohaku: {spike_count}/{raw_spike_count} volyymi-piikki ({spike_hours}h) + "
             f"{len(combined) - spike_count} top-holder täydennystä = {len(combined)} yhteensä"
         )
         try:
@@ -302,6 +308,35 @@ class PolymarketFetcher:
         except Exception as e:
             log.debug(f"Known wallet päivitys epäonnistui: {e}")
         return combined
+
+    def _rank_spike_wallets(self, wallet_stats: Dict[str, Dict[str, float]]) -> List[str]:
+        """Orders fresh buyers by recent size/count and optionally applies a cap."""
+        ranked = sorted(
+            wallet_stats.items(),
+            key=lambda item: (
+                float(item[1].get("total_size", 0.0) or 0.0),
+                int(item[1].get("buy_count", 0) or 0),
+                float(item[1].get("max_size", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        max_wallets = int(os.getenv("MAX_SPIKE_WALLETS", 0))
+        if max_wallets > 0 and len(ranked) > max_wallets:
+            log.info(f"Volyymi-piikki rajattu: {len(ranked)} -> {max_wallets} walletia")
+            ranked = ranked[:max_wallets]
+        return [wallet for wallet, _ in ranked]
+
+    def _extract_trade_size(self, trade: Dict) -> float:
+        for key in ("usdcSize", "size", "amount"):
+            raw = trade.get(key)
+            if raw is not None:
+                try:
+                    value = float(raw)
+                    if value > 0:
+                        return value
+                except (TypeError, ValueError):
+                    pass
+        return 0.0
 
     def _merge_known_wallets(self, wallets: List[str]) -> List[str]:
         """Lisää mukaan parhaat aiemmin löydetyt walletit konservatiivisella limitillä."""

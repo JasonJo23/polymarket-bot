@@ -29,6 +29,7 @@ import requests
 import re
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
+from state_store import read_json, write_json
 
 log = logging.getLogger("Scout.ProbabilityEngine")
 
@@ -42,7 +43,7 @@ class ProbabilityEngine:
         self.api_key         = os.getenv("ANTHROPIC_API_KEY", "")
         self.model           = os.getenv("PROBABILITY_MODEL", "claude-sonnet-4-20250514")
         self.min_data_quality = float(os.getenv("MIN_DATA_QUALITY", 0.3))
-        self.min_edge        = float(os.getenv("MIN_EDGE_THRESHOLD", 0.05))
+        self.min_edge        = float(os.getenv("MIN_EDGE_THRESHOLD", 0.08))
 
         if not self.api_key:
             log.warning("ANTHROPIC_API_KEY puuttuu — probability engine ei toimi")
@@ -393,10 +394,8 @@ Vastaa VAIN JSON, ei muuta tekstiä:
         Tulos (oikea/väärä) lisätään manuaalisesti tai automaattisesti myöhemmin.
         """
         try:
-            try:
-                with open(PREDICTIONS_FILE, "r") as f:
-                    log_data = json.load(f)
-            except FileNotFoundError:
+            log_data = read_json(PREDICTIONS_FILE, {"predictions": []})
+            if not isinstance(log_data, dict):
                 log_data = {"predictions": []}
 
             entry = {
@@ -416,8 +415,7 @@ Vastaa VAIN JSON, ei muuta tekstiä:
 
             log_data["predictions"].append(entry)
 
-            with open(PREDICTIONS_FILE, "w") as f:
-                json.dump(log_data, f, indent=2)
+            write_json(PREDICTIONS_FILE, log_data, indent=2)
 
         except Exception as e:
             log.debug(f"Prediction loki epäonnistui: {e}")
@@ -445,10 +443,9 @@ Vastaa VAIN JSON, ei muuta tekstiä:
         Aja manuaalisesti kun olet lisännyt actual_result-kentät.
         """
         try:
-            with open(PREDICTIONS_FILE, "r") as f:
-                data = json.load(f)
-            predictions = data.get("predictions", [])
-        except FileNotFoundError:
+            data = read_json(PREDICTIONS_FILE, {"predictions": []})
+            predictions = data.get("predictions", []) if isinstance(data, dict) else []
+        except Exception:
             return {"error": "Ei ennusteita vielä"}
 
         resolved = [p for p in predictions if p.get("actual_result") is not None]

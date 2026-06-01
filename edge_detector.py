@@ -165,7 +165,9 @@ class EdgeDetector:
             self._analysis_cache[cache_key] = fallback
             return fallback
 
-        result["data_quality"] = 0.5
+        result["data_quality"] = data_quality
+        result["market_data_quality"] = float(market_ctx.get("data_quality", 0.0) or 0.0)
+        result["fresh_data_quality"] = float(fresh_ctx.get("data_quality", 0.0) or 0.0)
         edge       = result.get("edge", 0.0)
         our_prob   = result.get("our_probability", token_price)
         confidence = result.get("confidence", "low")
