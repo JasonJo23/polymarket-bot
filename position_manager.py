@@ -429,6 +429,9 @@ def add_position(signal: Dict, token_id: str, buy_price: float, amount: float, e
         "edge_reason":      edge.get("reason", ""),
         "market_quality":   intelligence.get("market_quality", 0.0),
         "intel_confidence": intelligence.get("confidence", 0.0),
+        "bad_fill":         bool(signal.get("bad_fill", False)),
+        "force_exit":       bool(signal.get("force_exit", False)),
+        "bad_fill_reason":  signal.get("bad_fill_reason", ""),
     }
     positions.append(position)
     save_positions(positions)
@@ -466,7 +469,10 @@ def check_and_exit_positions():
 
         log.info(f"📊 {question[:35]} | {pnl_pct:+.1%} | {hours_left:.1f}h jäljellä")
 
-        if is_esports:
+        if pos.get("force_exit"):
+            should_sell = True
+            reason = pos.get("bad_fill_reason") or "Force exit"
+        elif is_esports:
             should_sell, reason = _evaluate_esports_position(pos)
         elif is_sports:
             should_sell, reason = _evaluate_sports_position(pos)

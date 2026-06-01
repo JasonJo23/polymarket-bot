@@ -335,8 +335,8 @@ class PolymarketFetcher:
             resp = self.session.get(
                 f"{DATA_BASE}/activity",
                 params={
-                    "market":        [condition_id],
-                    "type":          ["TRADE"],
+                    "market":        condition_id,
+                    "type":          "TRADE",
                     "side":          "BUY",
                     "start":         cutoff_ts,
                     "sortBy":        "TIMESTAMP",
@@ -357,7 +357,7 @@ class PolymarketFetcher:
         recent = []
         for trade in trades:
             trade_cid = self._extract_condition_id(trade)
-            if trade_cid != condition_id:
+            if trade_cid and trade_cid != condition_id:
                 continue
             ts = self._ts(trade)
             if ts is None or int(ts.timestamp()) < cutoff_ts:
@@ -397,7 +397,11 @@ class PolymarketFetcher:
     # ------------------------------------------------------------------
 
     def _ts(self, trade: Dict) -> Optional[datetime]:
-        raw = trade.get("timestamp")
+        raw = None
+        for key in ("timestamp", "createdAt", "created_at", "time"):
+            raw = trade.get(key)
+            if raw is not None:
+                break
         if raw is None:
             return None
         try:

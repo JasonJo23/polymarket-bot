@@ -687,7 +687,7 @@ class SignalTracker:
 
             if status == "matched" and has_fill_amounts:
                 token_amount = round(filled_tokens, 4)
-                self._log_fill_quality(
+                bad_fill = self._log_fill_quality(
                     signal=signal,
                     requested_price=exec_price,
                     actual_price=actual_fill_price,
@@ -696,8 +696,14 @@ class SignalTracker:
                 )
                 try:
                     from position_manager import add_position
-                    add_position(
+                    position_signal = self._position_signal_with_fill_guard(
                         signal=signal,
+                        bad_fill=bad_fill,
+                        requested_price=exec_price,
+                        actual_price=actual_fill_price,
+                    )
+                    add_position(
+                        signal=position_signal,
                         token_id=token_id,
                         buy_price=actual_fill_price,
                         amount=token_amount,
@@ -913,7 +919,7 @@ class SignalTracker:
         actual_price = round(filled_usdc / filled_tokens, 4) if filled_tokens > 0 else pending.get("requested_price", 0)
         token_amount = round(filled_tokens, 4)
 
-        self._log_fill_quality(
+        bad_fill = self._log_fill_quality(
             signal=signal,
             requested_price=float(pending.get("requested_price", 0) or 0),
             actual_price=actual_price,
@@ -923,8 +929,14 @@ class SignalTracker:
 
         try:
             from position_manager import add_position
-            add_position(
+            position_signal = self._position_signal_with_fill_guard(
                 signal=signal,
+                bad_fill=bad_fill,
+                requested_price=float(pending.get("requested_price", 0) or 0),
+                actual_price=actual_price,
+            )
+            add_position(
+                signal=position_signal,
                 token_id=token_id,
                 buy_price=actual_price,
                 amount=token_amount,
@@ -1110,9 +1122,9 @@ class SignalTracker:
         actual_price: float,
         filled_usdc: float,
         filled_tokens: float,
-    ) -> None:
+    ) -> bool:
         if requested_price <= 0 or actual_price <= 0:
-            return
+            return False
 
         diff = actual_price - requested_price
         slippage_pct = diff / requested_price
@@ -1145,6 +1157,28 @@ class SignalTracker:
                     )
             except Exception:
                 pass
+            return True
+        return False
+
+    def _position_signal_with_fill_guard(
+        self,
+        signal: Dict[str, Any],
+        bad_fill: bool,
+        requested_price: float,
+        actual_price: float,
+    ) -> Dict[str, Any]:
+        """Mark clearly bad fills so PositionManager can try to unwind them."""
+        if not bad_fill or os.getenv("BAD_FILL_FORCE_EXIT", "true").lower() != "true":
+            return signal
+
+        guarded = dict(signal)
+        guarded["bad_fill"] = True
+        guarded["force_exit"] = True
+        guarded["bad_fill_reason"] = (
+            f"Bad fill force exit: requested {requested_price:.4f}, "
+            f"actual {actual_price:.4f}"
+        )
+        return guarded
 
     def _classify_market(self, question: str) -> str:
         q = question.lower()

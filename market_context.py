@@ -206,10 +206,20 @@ def _best_question_match(question: str, markets: list, min_score: float = None) 
 def _extract_opponents(question: str, gamma_data: Dict) -> str:
     """Erottaa vastustajat kysymyksestä tai Gamma-datasta."""
     # Suora vs-muoto kysymyksessä
-    vs_match = re.search(r'(.+?)\s+vs\.?\s+(.+?)(?:\s*[\(\|]|$)', question, re.IGNORECASE)
+    cleaned_question = re.sub(
+        r"^(?:lol|dota\s*2?|cs2|csgo|valorant|nba|mlb|nhl|nfl|wnba|soccer|tennis):\s*",
+        "",
+        question or "",
+        flags=re.IGNORECASE,
+    ).strip()
+    vs_match = re.search(
+        r"(.+?)\s+vs\.?\s+(.+?)(?:\s*(?:\(|\||\s+-\s+|:)|$)",
+        cleaned_question,
+        re.IGNORECASE,
+    )
     if vs_match:
-        home = re.sub(r'^[A-Z]+[0-9]*:\s*', '', vs_match.group(1)).strip()
-        away = vs_match.group(2).strip()
+        home = _clean_opponent_name(vs_match.group(1))
+        away = _clean_opponent_name(vs_match.group(2))
         return f"{home} vs {away}"
 
     # Gamma description saattaa sisältää vastustajan
@@ -219,6 +229,13 @@ def _extract_opponents(question: str, gamma_data: Dict) -> str:
         return f"{vs_match2.group(1).strip()} vs {vs_match2.group(2).strip()}"
 
     return ""
+
+
+def _clean_opponent_name(name: str) -> str:
+    """Normalisoi joukkueen nimi ilman markkinan lisateksteja."""
+    cleaned = re.sub(r"\s+", " ", name or "").strip()
+    cleaned = re.sub(r"\s+(?:winner|moneyline|spread)$", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip(" -|:")
 
 
 def _extract_tournament(gamma_data: Dict) -> str:

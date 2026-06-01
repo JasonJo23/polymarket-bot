@@ -120,6 +120,27 @@ def _history_fingerprint(trade_history: List[Dict]) -> Dict:
     }
 
 
+def _score_cache_is_fresh(cached: Dict) -> bool:
+    """Allow recent wallet-score cache even when newest trade changed."""
+    try:
+        ttl_minutes = int(os.getenv("WALLET_SCORE_CACHE_TTL_MINUTES", "180"))
+    except ValueError:
+        ttl_minutes = 180
+    if ttl_minutes <= 0:
+        return False
+
+    raw = cached.get("updated_at", "")
+    if not raw:
+        return False
+    try:
+        updated_at = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    return datetime.now(timezone.utc) - updated_at <= timedelta(minutes=ttl_minutes)
+
+
 def _try_clob(condition_id: str) -> Optional[str]:
     try:
         r = requests.get(f"{CLOB_BASE}/markets/{condition_id}", timeout=5)
@@ -449,6 +470,10 @@ def calculate_wallet_score(
     max_markets:    int = 50
 ) -> Dict:
     _load_cache_from_disk()
+    try:
+        max_markets = int(os.getenv("WALLET_SCORE_MAX_MARKETS", str(max_markets)))
+    except ValueError:
+        pass
     market_positions = _group_trades_by_market(trade_history)
     activity = _activity_stats(trade_history)
     if not market_positions:
@@ -542,7 +567,7 @@ def score_wallets_batch(
     near_scores = []
     neutral_scores = []
     low_scores  = []
-    mm_total = no_data = cache_hits = priced_total = unpriced_total = 0
+    mm_total = no_data = cache_hits = ttl_cache_hits = priced_total = unpriced_total = 0
     no_data_resolved_counts = []
 
     for wallet in qualified_wallets:
@@ -553,6 +578,10 @@ def score_wallets_batch(
         if cached and cached.get("fingerprint") == fingerprint:
             score = cached.get("score", {})
             cache_hits += 1
+        elif cached and _score_cache_is_fresh(cached):
+            score = cached.get("score", {})
+            cache_hits += 1
+            ttl_cache_hits += 1
         else:
             score = calculate_wallet_score(addr, history)
             _wallet_score_cache[addr.lower()] = {
@@ -602,7 +631,7 @@ def score_wallets_batch(
         f"Wallet scoring valmis: {len(high_scores)} korkea | {len(near_scores)} lahella | "
         f"{len(neutral_scores)} neutraali | {len(low_scores)} matala | {no_data} ei dataa | "
         f"{mm_total} MM-kauppaa suodatettu | cache hit {cache_hits} | "
-        f"price coverage {price_coverage:.0%}"
+        f"ttl hit {ttl_cache_hits} | price coverage {price_coverage:.0%}"
     )
     if high_scores:
         log.info(f"🌟 TOP lompakot: {' | '.join(high_scores[:5])}")
