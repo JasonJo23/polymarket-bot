@@ -51,6 +51,8 @@ class PolymarketFetcher:
         self.top_holders          = int(os.getenv("TOP_HOLDERS", 15))
         self.closing_days         = int(os.getenv("CLOSING_DAYS", 3))
         self.min_volume_24h       = float(os.getenv("MIN_VOLUME_24H", 50000))
+        self.market_scan_limit    = int(os.getenv("MARKET_SCAN_LIMIT", 500))
+        self.market_page_size     = int(os.getenv("MARKET_PAGE_SIZE", 100))
         self.history_limit        = int(os.getenv("HISTORY_LIMIT_PER_WALLET", 100))  # PERF #1
         self._history_cache: Dict[str, List[Dict]] = {}
 
@@ -157,19 +159,27 @@ class PolymarketFetcher:
         now   = datetime.now(timezone.utc)
         limit = now + timedelta(days=self.closing_days)
 
-        data = self._get(f"{GAMMA_BASE}/markets", {
-            "limit":     50,
-            "active":    "true",
-            "closed":    "false",
-            "order":     "volume24hr",
-            "ascending": "false",
-        })
+        page_size = max(1, min(self.market_page_size, 500))
+        scan_limit = max(page_size, self.market_scan_limit)
+        markets: List[Dict[str, Any]] = []
 
-        if not isinstance(data, list):
-            return []
+        for offset in range(0, scan_limit, page_size):
+            data = self._get(f"{GAMMA_BASE}/markets", {
+                "limit":     page_size,
+                "offset":    offset,
+                "active":    "true",
+                "closed":    "false",
+                "order":     "volume24hr",
+                "ascending": "false",
+            })
+            if not isinstance(data, list) or not data:
+                break
+            markets.extend(data)
+            if len(data) < page_size:
+                break
 
         closing_soon = []
-        for m in data:
+        for m in markets:
             end_raw = m.get("endDate") or m.get("end_date", "")
             if not end_raw:
                 continue
@@ -185,7 +195,16 @@ class PolymarketFetcher:
             vol        = float(m.get("volume24hr") or m.get("volume") or 0)
             hours_left = (end_dt - now).total_seconds() / 3600
 
-            if now <= end_dt <= limit and vol >= self.min_volume_24h and hours_left >= 1.0:
+            accepting_orders = m.get("acceptingOrders")
+            if accepting_orders is None:
+                accepting_orders = m.get("accepting_orders", True)
+
+            if (
+                now <= end_dt <= limit
+                and vol >= self.min_volume_24h
+                and hours_left >= 1.0
+                and bool(accepting_orders)
+            ):
                 closing_soon.append(m)
 
         closing_soon.sort(key=lambda x: float(x.get("volume24hr") or 0), reverse=True)
@@ -193,7 +212,8 @@ class PolymarketFetcher:
 
         log.info(
             f"Pian sulkeutuvia markkinoita "
-            f"({self.closing_days}pv, >{self.min_volume_24h:.0f} USDC): {len(result)}"
+            f"({self.closing_days}pv, >{self.min_volume_24h:.0f} USDC): {len(result)} "
+            f"(skannattu {len(markets)} markkinaa)"
         )
         return result
 
