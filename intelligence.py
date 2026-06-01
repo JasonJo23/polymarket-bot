@@ -21,56 +21,18 @@ import os
 import logging
 import requests
 from typing import Dict, Any, Tuple
+from market_types import classify_market, confidence_multiplier, is_sports
 
 log = logging.getLogger("Scout.Intelligence")
 CLOB_BASE = "https://clob.polymarket.com"
 
-SPORTS_KEYWORDS = [
-    "vs.", "vs ", "game 1", "game 2", "game 3", "bo3", "bo5",
-    "winner", "match", "series",
-    "nba", "nfl", "nhl", "mlb", "wnba",
-    "lakers", "celtics", "knicks", "hawks", "bulls", "heat",
-    "thunder", "pistons", "magic", "rockets", "spurs", "raptors",
-    "cavaliers", "76ers", "trail blazers", "nuggets", "timberwolves",
-    "pacers", "bucks", "clippers", "warriors", "suns", "jazz",
-    "bruins", "sabres", "lightning", "oilers", "ducks", "avalanche",
-    "kings", "canadiens", "flyers", "golden knights", "panthers",
-    "angels", "royals", "red sox", "orioles", "yankees", "dodgers",
-    "lol:", "dota", "csgo", "valorant", "counter-strike",
-    "fc ", "win on", "epl", "bundesliga", "serie a", "la liga",
-    "premier league", "champions league", "barcelona", "madrid",
-    "manchester", "arsenal", "liverpool", "chelsea", "tottenham",
-    "juventus", "milan", "inter", "napoli", "marseille", "lille",
-    "atletico", "bayern", "borussia", "ajax", "porto", "benfica",
-    "ufc", "mma", "fight night", "boxing",
-    "innings", "o/u", "spread",
-    "esports world cup", "lck", "lec", "lcs", "pgl", "esl",
-]
-
-HIGH_QUALITY_KEYWORDS = [
-    "trump", "biden", "election", "fed", "bitcoin", "ethereum",
-    "btc", "eth", "crypto", "gdp", "inflation", "iran", "ceasefire",
-    "war", "congress", "senate", "president", "rate", "tariff",
-    "treasury", "powell", "policy", "agreement", "deal", "treaty",
-    "tariffs", "recession", "default", "sanctions", "nuclear",
-    "elon", "musk", "apple", "nvidia", "tesla", "nasdaq",
-]
-
-
 def _is_sports(question: str) -> bool:
-    q = question.lower()
-    return any(kw in q for kw in SPORTS_KEYWORDS)
+    return is_sports(question)
 
 
 def _detect_category(question: str) -> Tuple[str, float]:
-    q = question.lower()
-    for kw in SPORTS_KEYWORDS:
-        if kw in q:
-            return "sports", 0.7
-    for kw in HIGH_QUALITY_KEYWORDS:
-        if kw in q:
-            return "politics/macro", 1.0
-    return "general", 0.9
+    market_type = classify_market(question)
+    return market_type, confidence_multiplier(market_type)
 
 
 def _get_order_book_quality(token_id: str) -> float:

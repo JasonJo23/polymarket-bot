@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 from state_store import read_json, write_json
+from market_types import classify_market
 
 log = logging.getLogger("Scout.WalletScorer")
 
@@ -326,27 +327,7 @@ def _roi_to_weight(weighted_roi: float) -> float:
 
 
 def _classify_market_text(text: str) -> str:
-    q = (text or "").lower()
-    esports = any(k in q for k in [
-        "lol:", "dota", "cs2", "csgo", "counter-strike", "valorant",
-        "lck", "lec", "lpl", "vct", "iem", "pgl", "blast", "dreamleague",
-    ])
-    if esports:
-        if any(k in q for k in ["game ", "map "]):
-            return "esports_map"
-        return "esports_match"
-    if any(k in q for k in [
-        "vs.", "vs ", "winner", "match", "series", "spread", "o/u",
-        "nba", "nfl", "nhl", "mlb", "atp", "wta", "ufc", "fc ",
-    ]):
-        return "sports"
-    if any(k in q for k in [
-        "iran", "trump", "biden", "election", "fed", "btc", "eth",
-        "bitcoin", "ethereum", "tariff", "ceasefire", "invade",
-        "uranium", "peace deal",
-    ]):
-        return "macro"
-    return "general"
+    return classify_market(text)
 
 
 def _trade_market_text(trade: Dict) -> str:

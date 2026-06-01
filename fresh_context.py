@@ -13,6 +13,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Any, Optional
 
 import requests
+from market_types import classify_market
 try:
     import feedparser
 except Exception:
@@ -133,14 +134,10 @@ class FreshContextFetcher:
             target[key].extend(update.get(key, []))
 
     def _detect_category(self, question: str, market_type: str) -> str:
-        if market_type in ("esports_match", "esports_map"):
+        canonical_type = market_type or classify_market(question)
+        if canonical_type in ("esports_match", "esports_map"):
             return "esports"
-        if market_type == "sports":
-            return "sports"
-        q = question.lower()
-        if any(k in q for k in ["lol:", "dota", "cs2", "csgo", "valorant", "lck", "lec", "lpl"]):
-            return "esports"
-        if any(k in q for k in ["vs.", "vs ", "nba", "nhl", "mlb", "nfl", "fc ", "o/u", "spread"]):
+        if canonical_type == "sports":
             return "sports"
         return ""
 

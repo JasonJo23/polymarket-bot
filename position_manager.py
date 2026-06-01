@@ -10,12 +10,14 @@ Korjaukset v2.0:
 """
 
 import os
-import json
 import logging
 import requests
 from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional, Tuple
 from state_store import read_json, write_json
+from market_types import is_sports as _market_is_sports
+from market_types import is_esports as _market_is_esports
+from market_types import is_esports_map as _market_is_esports_map
 
 log = logging.getLogger("Scout.PositionManager")
 
@@ -28,42 +30,16 @@ CLOB_BASE = "https://clob.polymarket.com"
 POSITION_DUST_TOKEN_THRESHOLD = float(os.getenv("POSITION_DUST_TOKEN_THRESHOLD", "0.01"))
 POSITION_DUST_USDC_THRESHOLD = float(os.getenv("POSITION_DUST_USDC_THRESHOLD", "0.25"))
 
-SPORTS_KEYWORDS = [
-    "vs.", "vs ", "game 1", "game 2", "game 3", "bo3", "bo5",
-    "winner", "match", "series",
-    "nba", "nfl", "nhl", "mlb", "wnba",
-    "lakers", "celtics", "knicks", "hawks", "bulls", "heat",
-    "thunder", "pistons", "magic", "rockets", "spurs", "raptors",
-    "cavaliers", "76ers", "trail blazers", "nuggets", "timberwolves",
-    "bruins", "sabres", "lightning", "oilers", "ducks", "avalanche",
-    "kings", "canadiens", "flyers", "golden knights", "utah",
-    "angels", "royals", "red sox", "orioles", "yankees",
-    "lol:", "dota", "csgo", "valorant", "counter-strike",
-    "fc ", "win on", "epl", "bundesliga", "serie a", "la liga",
-    "premier league", "champions league", "barcelona", "madrid",
-    "manchester", "arsenal", "liverpool", "chelsea", "tottenham",
-    "juventus", "milan", "inter", "napoli", "marseille", "lille",
-    "ufc", "mma", "fight night",
-    "innings", "o/u", "over", "under", "spread",
-]
-
-
 def _is_sports(question: str) -> bool:
-    q = question.lower()
-    return any(kw in q for kw in SPORTS_KEYWORDS)
+    return _market_is_sports(question)
 
 
 def _is_esports(question: str) -> bool:
-    q = question.lower()
-    return any(kw in q for kw in [
-        "lol:", "dota", "csgo", "cs2", "valorant", "counter-strike",
-        "lck", "lec", "lpl", "vct", "iem", "pgl", "blast", "dreamleague",
-    ])
+    return _market_is_esports(question)
 
 
 def _is_esports_map(question: str) -> bool:
-    q = question.lower()
-    return _is_esports(question) and any(kw in q for kw in ["game ", "map "])
+    return _market_is_esports_map(question)
 
 
 def _get_current_price(token_id: str) -> Optional[float]:

@@ -26,6 +26,7 @@ import os
 import logging
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
+from market_types import classify_market, price_bounds
 
 log = logging.getLogger("Scout.EdgeDetector")
 
@@ -227,46 +228,17 @@ class EdgeDetector:
         return final
 
     def _detect_sport(self, question: str) -> str:
-        q = question.lower()
-        if any(k in q for k in ["lol:", "cs2", "csgo", "valorant", "dota", "esports", "lck", "lec", "counter-strike"]):
-            if any(k in q for k in ["game ", "map "]):
-                return "esports_map"
-            return "esports_match"
-        if any(k in q for k in ["lakers", "celtics", "knicks", "nba", "thunder", "spurs", "76ers", "cavaliers", "pistons", "timberwolves"]):
-            return "sports"
-        if any(k in q for k in ["fc ", "arsenal", "chelsea", "liverpool", "madrid", "barcelona", "premier league", "la liga"]):
-            return "sports"
-        if any(k in q for k in ["trump", "biden", "iran", "election", "fed", "btc", "eth", "tariff", "ceasefire"]):
-            return "macro"
-        return "general"
+        return classify_market(question)
 
     def _price_bounds(self, market_type: str, relaxed: bool = False) -> tuple:
-        bounds = {
-            "macro": (
-                float(os.getenv("MACRO_MIN_TOKEN_PRICE", 0.20)),
-                float(os.getenv("MACRO_MAX_TOKEN_PRICE", 0.85)),
-            ),
-            "sports": (
-                float(os.getenv("SPORTS_MIN_TOKEN_PRICE", 0.25)),
-                float(os.getenv("SPORTS_MAX_TOKEN_PRICE", 0.85)),
-            ),
-            "esports_match": (
-                float(os.getenv("ESPORTS_MATCH_MIN_TOKEN_PRICE", 0.30)),
-                float(os.getenv("ESPORTS_MATCH_MAX_TOKEN_PRICE", 0.78)),
-            ),
-            "esports_map": (
-                float(os.getenv("ESPORTS_MAP_MIN_TOKEN_PRICE", 0.35)),
-                float(os.getenv("ESPORTS_MAP_MAX_TOKEN_PRICE", 0.70)),
-            ),
-            "general": (
-                self.min_token_price,
-                self.max_token_price,
-            ),
-        }
-        low, high = bounds.get(market_type, bounds["general"])
-        if relaxed and market_type in ("macro", "sports", "esports_match"):
-            return max(0.05, low - 0.05), min(0.90, high + 0.05)
-        return low, high
+        if market_type == "general":
+            low = float(os.getenv("GENERAL_MIN_TOKEN_PRICE", self.min_token_price))
+            high = float(os.getenv("GENERAL_MAX_TOKEN_PRICE", self.max_token_price))
+            if relaxed:
+                buffer = float(os.getenv("CANDIDATE_PRICE_BUFFER", 0.02))
+                return max(0.01, low - buffer), min(0.99, high + buffer)
+            return low, high
+        return price_bounds(market_type, relaxed=relaxed)
 
     def _reasoning_flags_bad_context(self, reasoning: str) -> bool:
         text = (reasoning or "").lower()

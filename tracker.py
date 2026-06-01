@@ -29,6 +29,7 @@ import requests
 from datetime import datetime, timezone, timedelta, date
 from collections import defaultdict
 from state_store import read_json, write_json
+from market_types import classify_market, price_bounds, order_cap, is_sports, is_esports
 
 log = logging.getLogger("Scout.Tracker")
 
@@ -435,8 +436,6 @@ class SignalTracker:
             pass
 
         try:
-            from intelligence import _is_sports as _check_sports
-
             condition_id = signal["market_id"]
             outcome_name = signal["outcome"].strip('"').upper()
 
@@ -610,13 +609,16 @@ class SignalTracker:
                 funder=os.getenv("PROXY_WALLET_ADDRESS")
             )
 
-            is_sports = _check_sports(signal.get("question", ""))
+            is_fast_event_market = (
+                is_sports(signal.get("question", "")) or
+                is_esports(signal.get("question", ""))
+            )
             options   = PartialCreateOrderOptions(tick_size=tick_size)
 
-            if is_sports:
+            if is_fast_event_market:
                 slippage   = float(os.getenv("SLIPPAGE_PCT", 0.02))
                 exec_price = round(min(token_price * (1 + slippage), 0.90), 3)
-                log.info(f"FOK urheilu: {token_price} → {exec_price} | {order_size} USDC")
+                log.info(f"FOK event: {token_price} → {exec_price} | {order_size} USDC")
                 resp = client.create_and_post_market_order(
                     order_args=MarketOrderArgs(
                         token_id=token_id,
@@ -1152,62 +1154,13 @@ class SignalTracker:
         return guarded
 
     def _classify_market(self, question: str) -> str:
-        q = question.lower()
-        esports = any(k in q for k in [
-            "lol:", "dota", "cs2", "csgo", "counter-strike", "valorant",
-            "lck", "lec", "lpl", "vct", "iem", "pgl", "blast", "dreamleague",
-        ])
-        if esports:
-            if any(k in q for k in ["game ", "map "]):
-                return "esports_map"
-            return "esports_match"
-        if any(k in q for k in [
-            "vs.", "vs ", "winner", "match", "series", "spread", "o/u",
-            "nba", "nfl", "nhl", "mlb", "atp", "wta", "ufc", "fc ",
-        ]):
-            return "sports"
-        if any(k in q for k in [
-            "iran", "trump", "biden", "election", "fed", "btc", "eth",
-            "bitcoin", "ethereum", "tariff", "ceasefire", "invade",
-            "uranium", "peace deal",
-        ]):
-            return "macro"
-        return "general"
+        return classify_market(question)
 
     def _price_bounds(self, market_type: str) -> tuple:
-        bounds = {
-            "macro": (
-                float(os.getenv("MACRO_MIN_TOKEN_PRICE", 0.20)),
-                float(os.getenv("MACRO_MAX_TOKEN_PRICE", 0.85)),
-            ),
-            "sports": (
-                float(os.getenv("SPORTS_MIN_TOKEN_PRICE", 0.25)),
-                float(os.getenv("SPORTS_MAX_TOKEN_PRICE", 0.85)),
-            ),
-            "esports_match": (
-                float(os.getenv("ESPORTS_MATCH_MIN_TOKEN_PRICE", 0.30)),
-                float(os.getenv("ESPORTS_MATCH_MAX_TOKEN_PRICE", 0.78)),
-            ),
-            "esports_map": (
-                float(os.getenv("ESPORTS_MAP_MIN_TOKEN_PRICE", 0.35)),
-                float(os.getenv("ESPORTS_MAP_MAX_TOKEN_PRICE", 0.70)),
-            ),
-            "general": (
-                float(os.getenv("GENERAL_MIN_TOKEN_PRICE", 0.25)),
-                float(os.getenv("GENERAL_MAX_TOKEN_PRICE", 0.80)),
-            ),
-        }
-        return bounds.get(market_type, bounds["general"])
+        return price_bounds(market_type)
 
     def _market_order_cap(self, market_type: str) -> float:
-        caps = {
-            "macro": float(os.getenv("MACRO_MAX_ORDER_SIZE_USDC", self.max_order_usdc)),
-            "sports": float(os.getenv("SPORTS_MAX_ORDER_SIZE_USDC", self.max_order_usdc)),
-            "esports_match": float(os.getenv("ESPORTS_MATCH_MAX_ORDER_SIZE_USDC", 25)),
-            "esports_map": float(os.getenv("ESPORTS_MAP_MAX_ORDER_SIZE_USDC", 15)),
-            "general": float(os.getenv("GENERAL_MAX_ORDER_SIZE_USDC", 20)),
-        }
-        return caps.get(market_type, caps["general"])
+        return order_cap(market_type, self.max_order_usdc)
 
     def _wallet_market_weight(self, supporter: Dict[str, Any], market_type: str) -> float:
         category_weights = supporter.get("category_weights") or {}
@@ -1230,9 +1183,8 @@ class SignalTracker:
         edge = float(edge_info.get("edge", 0.0) or 0.0)
         confidence = str(edge_info.get("confidence", "low")).lower()
 
-        if confidence == "high" and edge >= 0.15 and market_type in ("macro", "sports", "esports_match"):
-            low = max(0.05, low - 0.05)
-            high = min(0.90, high + 0.05)
+        if confidence == "high" and edge >= 0.15 and market_type in ("macro", "sports", "esports_match", "esports_map"):
+            low, high = price_bounds(market_type, relaxed=True)
 
         if token_price < low:
             return {"approved": False, "reason": f"{market_type} hinta liian matala {token_price:.3f} < {low:.2f}"}
@@ -1241,10 +1193,7 @@ class SignalTracker:
         return {"approved": True, "reason": "OK"}
 
     def _passes_candidate_price_rules(self, market_type: str, token_price: float) -> Dict[str, Any]:
-        low, high = self._price_bounds(market_type)
-        buffer = float(os.getenv("CANDIDATE_PRICE_BUFFER", 0.02))
-        low = max(0.01, low - buffer)
-        high = min(0.99, high + buffer)
+        low, high = price_bounds(market_type, relaxed=True)
         if token_price < low:
             return {"approved": False, "reason": f"{market_type} candidate price too low {token_price:.3f} < {low:.2f}"}
         if token_price > high:
