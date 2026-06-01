@@ -333,10 +333,9 @@ class PolymarketFetcher:
         """Hakee markkinan tuoreet treidit ja palauttaa vain cutoffin jälkeiset."""
         try:
             resp = self.session.get(
-                f"{DATA_BASE}/activity",
+                f"{DATA_BASE}/trades",
                 params={
                     "market":        condition_id,
-                    "type":          "TRADE",
                     "side":          "BUY",
                     "start":         cutoff_ts,
                     "sortBy":        "TIMESTAMP",
@@ -346,7 +345,7 @@ class PolymarketFetcher:
                 timeout=8,
             )
             if resp.status_code != 200:
-                log.debug(f"Market activity ei saatavilla ({resp.status_code}): {resp.text[:120]}")
+                log.debug(f"Market trades ei saatavilla ({resp.status_code}): {resp.text[:120]}")
                 return []
             data = resp.json()
         except requests.exceptions.RequestException as e:
