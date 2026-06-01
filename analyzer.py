@@ -137,6 +137,7 @@ class WalletAnalyzer:
 
         return {
             "address":           address,
+            "wallet_source":     self._wallet_source(trades),
             "win_rate":          0.0,
             "trades_48h":        trades_48h,
             "avg_size_usdc":     avg_size,
@@ -193,3 +194,10 @@ class WalletAnalyzer:
                 except (TypeError, ValueError):
                     pass
         return 0.0
+
+    def _wallet_source(self, trades: List[Dict]) -> str:
+        for trade in trades:
+            source = trade.get("_wallet_source")
+            if source:
+                return str(source)
+        return "unknown"

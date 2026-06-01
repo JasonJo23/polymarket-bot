@@ -209,11 +209,14 @@ def main():
                         )
                     log.info(f"Smart Follow -kandidaatteja jatkotarkastukseen: {len(signals)}")
                     for sig in signals[:20]:
+                        sources = sig.get("source_breakdown", {}) or {}
                         log.info(
                             f"  🎯 {sig.get('question','')[:45]} | "
+                            f"type={sig.get('signal_type', 'smart_follow')} | "
                             f"Tuki: {sig['support_count']} lompakon | "
                             f"w={sig.get('weighted_support', 0):.2f} | "
                             f"high={sig.get('high_weight_support', 0)} | "
+                            f"src=s{sources.get('spike', 0)}/k{sources.get('known', 0)}/h{sources.get('holder', 0)} | "
                             f"hinta={sig.get('token_price', 0):.3f} | "
                             f"liike={sig.get('price_move_since_first_seen', 0):+.3f} | "
                             f"Outcome: {sig['outcome']} | "

@@ -55,6 +55,8 @@ class PolymarketFetcher:
         self.market_page_size     = int(os.getenv("MARKET_PAGE_SIZE", 100))
         self.history_limit        = int(os.getenv("HISTORY_LIMIT_PER_WALLET", 100))  # PERF #1
         self._history_cache: Dict[str, List[Dict]] = {}
+        self._wallet_sources: Dict[str, str] = {}
+        self._scout_market_ids: set[str] = set()
 
     # ------------------------------------------------------------------
     # Päämetodi
@@ -69,6 +71,8 @@ class PolymarketFetcher:
           4. Palauta viimeiset 48h kaupat analyysiin
         """
         self._history_cache.clear()
+        self._wallet_sources.clear()
+        self._scout_market_ids.clear()
 
         # Vaihe 1: Pian sulkeutuvat markkinat
         markets = self._fetch_closing_soon_markets()
@@ -83,6 +87,11 @@ class PolymarketFetcher:
         if not markets:
             log.error("Ei markkinoita saatu.")
             return []
+        self._scout_market_ids = {
+            str(m.get("conditionId") or m.get("condition_id") or "")
+            for m in markets
+            if m.get("conditionId") or m.get("condition_id")
+        }
 
         log.info(f"Scouttaus {len(markets)} markkinalla.")
         for m in markets[:3]:
@@ -116,6 +125,9 @@ class PolymarketFetcher:
             ]
             for t in recent:
                 t.setdefault("proxyWallet", wallet)
+                t.setdefault("_wallet_source", self._wallet_sources.get(wallet.lower(), "unknown"))
+                cid = self._extract_condition_id(t)
+                t.setdefault("_in_scout_scope", bool(cid and cid in self._scout_market_ids))
             return wallet, history, recent
 
         max_workers = int(os.getenv("FETCH_WORKERS", 16))
@@ -271,6 +283,7 @@ class PolymarketFetcher:
                     stats["buy_count"] += 1
                     stats["total_size"] += size
                     stats["max_size"] = max(stats["max_size"], size)
+                    self._wallet_sources[addr] = "spike"
 
             # Hae top-holderit fallbackiksi ja scoringin historian lähteeksi.
             data = self._get(f"{DATA_BASE}/holders", {
@@ -282,7 +295,9 @@ class PolymarketFetcher:
                     for h in token_obj.get("holders", []):
                         addr = h.get("proxyWallet", "")
                         if addr and addr.startswith("0x") and len(addr) == 42:
-                            wallets_holders.add(addr.lower())
+                            normalized = addr.lower()
+                            wallets_holders.add(normalized)
+                            self._wallet_sources.setdefault(normalized, "holder")
 
             time.sleep(self.request_delay)
 
@@ -350,6 +365,7 @@ class PolymarketFetcher:
             return wallets
 
         seen = set()
+        known_set = {str(wallet).lower() for wallet in known_wallets}
         combined = []
         for wallet in list(wallets) + known_wallets:
             addr = str(wallet).lower()
@@ -358,6 +374,8 @@ class PolymarketFetcher:
             if addr.startswith("0x") and len(addr) == 42:
                 seen.add(addr)
                 combined.append(addr)
+                if addr in known_set and addr not in self._wallet_sources:
+                    self._wallet_sources[addr] = "known"
 
         extra = len(combined) - len(wallets)
         if extra > 0:

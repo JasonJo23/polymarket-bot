@@ -231,6 +231,8 @@ class SignalTracker:
                     "category_weights": wallet.get("category_weights", {}),
                     "active_recently": wallet.get("active_recently", False),
                     "trades_14d": wallet.get("trades_14d", 0),
+                    "source": wallet.get("wallet_source", "unknown"),
+                    "in_scout_scope": bool(trade.get("_in_scout_scope", False)),
                 })
 
         # Hae markkinatiedot rinnakkain
@@ -315,11 +317,27 @@ class SignalTracker:
                     if self._wallet_category_positive(s, market_type)
                 )
                 active_support = sum(1 for s in by_wallet.values() if s.get("active_recently", False))
+                scout_scope_support = sum(1 for s in by_wallet.values() if s.get("in_scout_scope", False))
                 reliable_support = sum(1 for s in by_wallet.values() if s.get("reliable", False))
                 unknown_support = len(unique_wallets) - reliable_support
                 high_weight_support = sum(
                     1 for s in by_wallet.values()
                     if self._wallet_market_weight(s, market_type) >= 1.5
+                )
+                source_breakdown = self._support_source_breakdown(by_wallet)
+                signal_profile = self._signal_quality_profile(
+                    market_type=market_type,
+                    support_count=len(unique_wallets),
+                    weighted_support=weighted_support,
+                    positive_roi_support=positive_roi_support,
+                    category_positive_support=category_positive_support,
+                    active_support=active_support,
+                    scout_scope_support=scout_scope_support,
+                    reliable_support=reliable_support,
+                    unknown_support=unknown_support,
+                    high_weight_support=high_weight_support,
+                    total_size=total_size,
+                    source_breakdown=source_breakdown,
                 )
                 timing = self._update_signal_timing(
                     market_id=market_id,
@@ -327,7 +345,8 @@ class SignalTracker:
                     token_price=token_price,
                     now_dt=now_dt,
                 )
-                if abs(timing["price_move_since_first_seen"]) > self.max_signal_price_move:
+                late_or_volatile = abs(timing["price_move_since_first_seen"]) > self.max_signal_price_move
+                if late_or_volatile and not self._passes_late_quality_override(signal_profile, timing):
                     funnel["late_or_volatile"] += 1
                     self._append_signal_snapshot({
                         "market_id": market_id,
@@ -335,26 +354,39 @@ class SignalTracker:
                         "outcome": outcome,
                         "market_type": market_type,
                         "token_price": token_price,
+                        "signal_profile": signal_profile,
+                        "source_breakdown": source_breakdown,
                         **timing,
                     }, status="rejected_late_or_volatile")
                     continue
+                if late_or_volatile:
+                    funnel["late_quality_override"] += 1
 
-                if (len(unique_wallets) >= self.smart_threshold and
-                        total_size >= self.min_signal_size and
-                        self._passes_wallet_quality(
-                            market_type=market_type,
-                            support_count=len(unique_wallets),
-                            weighted_support=weighted_support,
-                            positive_roi_support=positive_roi_support,
-                            category_positive_support=category_positive_support,
-                            active_support=active_support,
-                            high_weight_support=high_weight_support,
-                        )):
+                smart_follow = (
+                    len(unique_wallets) >= self.smart_threshold and
+                    total_size >= self.min_signal_size and
+                    self._passes_wallet_quality(
+                        market_type=market_type,
+                        support_count=len(unique_wallets),
+                        weighted_support=weighted_support,
+                        positive_roi_support=positive_roi_support,
+                        category_positive_support=category_positive_support,
+                        active_support=active_support,
+                        high_weight_support=high_weight_support,
+                    )
+                )
+                fresh_spike = (not smart_follow) and self._passes_fresh_spike(signal_profile, timing)
+
+                if smart_follow or fresh_spike:
+                    signal_type = "smart_follow" if smart_follow else "fresh_spike"
+                    if fresh_spike:
+                        funnel["fresh_spike_candidates"] += 1
                     signals.append({
                         "market_id":        market_id,
                         "question":         question,
                         "end_date":         end_date if end_date else "?",
                         "outcome":          outcome,
+                        "signal_type":      signal_type,
                         "market_type":      market_type,
                         "token_price":       token_price,
                         "support_count":    len(unique_wallets),
@@ -363,8 +395,11 @@ class SignalTracker:
                         "positive_roi_support": positive_roi_support,
                         "category_positive_support": category_positive_support,
                         "active_support": active_support,
+                        "scout_scope_support": scout_scope_support,
                         "reliable_support": reliable_support,
                         "unknown_support": unknown_support,
+                        "source_breakdown": source_breakdown,
+                        "signal_profile": signal_profile,
                         "supporters":       list(unique_wallets),
                         "total_size_usdc":  total_size,
                         "timestamp":        datetime.now(timezone.utc).isoformat(),
@@ -404,6 +439,8 @@ class SignalTracker:
             f"closed/missing={funnel['market_closed_or_missing']} | "
             f"price_extreme={funnel['price_extreme']} | "
             f"late/volatile={funnel['late_or_volatile']} | "
+            f"late_override={funnel['late_quality_override']} | "
+            f"fresh_spike={funnel['fresh_spike_candidates']} | "
             f"wallet_quality/size={funnel['wallet_quality_or_size']} | "
             f"missing_price={funnel['missing_price']}"
         )
@@ -1021,6 +1058,8 @@ class SignalTracker:
         support_multiplier = min(1.3, max(0.8, weighted_support / max(self.smart_threshold, 1)))
 
         size = confidence_base * edge_multiplier * market_multiplier * support_multiplier
+        if signal.get("signal_type") == "fresh_spike":
+            size *= float(os.getenv("FRESH_SPIKE_ORDER_MULTIPLIER", 0.5))
         market_cap = self._market_order_cap(market_type)
         return max(round(min(size, self.max_order_usdc, market_cap), 2), self.min_order_usdc)
 
@@ -1178,6 +1217,82 @@ class SignalTracker:
             float(category.get("weighted_roi", 0.0) or 0.0) > 0
         )
 
+    def _support_source_breakdown(self, by_wallet: Dict[str, Dict[str, Any]]) -> Dict[str, int]:
+        breakdown = {"spike": 0, "known": 0, "holder": 0, "unknown": 0}
+        for supporter in by_wallet.values():
+            source = str(supporter.get("source", "unknown") or "unknown")
+            if source not in breakdown:
+                source = "unknown"
+            breakdown[source] += 1
+        return breakdown
+
+    def _signal_quality_profile(
+        self,
+        market_type: str,
+        support_count: int,
+        weighted_support: float,
+        positive_roi_support: int,
+        category_positive_support: int,
+        active_support: int,
+        scout_scope_support: int,
+        reliable_support: int,
+        unknown_support: int,
+        high_weight_support: int,
+        total_size: float,
+        source_breakdown: Dict[str, int],
+    ) -> Dict[str, Any]:
+        weighted_ratio = weighted_support / max(support_count, 1)
+        return {
+            "market_type": market_type,
+            "support_count": support_count,
+            "weighted_support": round(weighted_support, 2),
+            "weighted_ratio": round(weighted_ratio, 3),
+            "positive_roi_support": positive_roi_support,
+            "category_positive_support": category_positive_support,
+            "active_support": active_support,
+            "scout_scope_support": scout_scope_support,
+            "reliable_support": reliable_support,
+            "unknown_support": unknown_support,
+            "high_weight_support": high_weight_support,
+            "total_size_usdc": round(total_size, 2),
+            "spike_support": source_breakdown.get("spike", 0),
+            "known_support": source_breakdown.get("known", 0),
+            "holder_support": source_breakdown.get("holder", 0),
+            "unknown_source_support": source_breakdown.get("unknown", 0),
+        }
+
+    def _passes_fresh_spike(self, profile: Dict[str, Any], timing: Dict[str, Any]) -> bool:
+        min_support = int(os.getenv("FRESH_SPIKE_MIN_SUPPORT", max(self.smart_threshold + 5, 10)))
+        min_size = float(os.getenv("FRESH_SPIKE_MIN_SIZE_USDC", max(self.min_signal_size * 2, 100000)))
+        min_spike_support = int(os.getenv("FRESH_SPIKE_MIN_SOURCE_SUPPORT", max(6, min_support // 2)))
+        min_weighted_ratio = float(os.getenv("FRESH_SPIKE_MIN_WEIGHTED_RATIO", 0.65))
+        max_price_move = float(os.getenv("FRESH_SPIKE_MAX_PRICE_MOVE", 0.06))
+        min_active = int(os.getenv("FRESH_SPIKE_MIN_ACTIVE_SUPPORT", 1))
+        min_scope = int(os.getenv("FRESH_SPIKE_MIN_SCOUT_SCOPE_SUPPORT", 0))
+
+        return (
+            int(profile.get("support_count", 0)) >= min_support and
+            float(profile.get("total_size_usdc", 0.0)) >= min_size and
+            int(profile.get("spike_support", 0)) >= min_spike_support and
+            int(profile.get("scout_scope_support", 0)) >= min_scope and
+            float(profile.get("weighted_ratio", 0.0)) >= min_weighted_ratio and
+            int(profile.get("active_support", 0)) >= min_active and
+            abs(float(timing.get("price_move_since_first_seen", 0.0) or 0.0)) <= max_price_move
+        )
+
+    def _passes_late_quality_override(self, profile: Dict[str, Any], timing: Dict[str, Any]) -> bool:
+        max_late_move = float(os.getenv("LATE_QUALITY_MAX_PRICE_MOVE", 0.18))
+        min_support = int(os.getenv("LATE_QUALITY_MIN_SUPPORT", max(self.smart_threshold + 4, 9)))
+        min_weighted = float(os.getenv("LATE_QUALITY_MIN_WEIGHTED_SUPPORT", max(self.smart_threshold * 1.8, 9)))
+        min_high_weight = int(os.getenv("LATE_QUALITY_MIN_HIGH_WEIGHT_SUPPORT", 4))
+        move = abs(float(timing.get("price_move_since_first_seen", 0.0) or 0.0))
+        return (
+            move <= max_late_move and
+            int(profile.get("support_count", 0)) >= min_support and
+            float(profile.get("weighted_support", 0.0)) >= min_weighted and
+            int(profile.get("high_weight_support", 0)) >= min_high_weight
+        )
+
     def _passes_price_rules(self, market_type: str, token_price: float, edge_info: Dict[str, Any]) -> Dict[str, Any]:
         low, high = self._price_bounds(market_type)
         edge = float(edge_info.get("edge", 0.0) or 0.0)
@@ -1285,6 +1400,7 @@ class SignalTracker:
             "market_id": signal.get("market_id"),
             "question": signal.get("question"),
             "outcome": signal.get("outcome"),
+            "signal_type": signal.get("signal_type"),
             "market_type": signal.get("market_type"),
             "token_price": signal.get("token_price"),
             "price_at_first_seen": signal.get("price_at_first_seen"),
@@ -1296,8 +1412,11 @@ class SignalTracker:
             "positive_roi_support": signal.get("positive_roi_support"),
             "category_positive_support": signal.get("category_positive_support"),
             "active_support": signal.get("active_support"),
+            "scout_scope_support": signal.get("scout_scope_support"),
             "reliable_support": signal.get("reliable_support"),
             "unknown_support": signal.get("unknown_support"),
+            "source_breakdown": signal.get("source_breakdown"),
+            "signal_profile": signal.get("signal_profile"),
             "total_size_usdc": signal.get("total_size_usdc"),
         }
         try:
