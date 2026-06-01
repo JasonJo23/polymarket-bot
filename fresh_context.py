@@ -174,15 +174,21 @@ class FreshContextFetcher:
 
     def _extract_teams(self, question: str) -> Dict[str, str]:
         q = re.sub(r"\s+", " ", question).strip()
+        q = re.sub(r"^(?:game|map)\s+handicap:\s*", "", q, flags=re.IGNORECASE)
         match = re.search(r"(.+?)\s+vs\.?\s+(.+?)(?:\s*[\(\-:|]|$)", q, re.IGNORECASE)
         if match:
-            home = re.sub(r"^[A-Za-z0-9 ]+:\s*", "", match.group(1)).strip()
-            away = match.group(2).strip()
+            home = self._clean_team_name(re.sub(r"^[A-Za-z0-9 ]+:\s*", "", match.group(1)))
+            away = self._clean_team_name(match.group(2))
             return {"home": home, "away": away}
         will_match = re.search(r"Will\s+(.+?)\s+(?:win|beat|score)", q, re.IGNORECASE)
         if will_match:
-            return {"home": will_match.group(1).strip()}
+            return {"home": self._clean_team_name(will_match.group(1))}
         return {}
+
+    def _clean_team_name(self, name: str) -> str:
+        cleaned = re.sub(r"\s+", " ", name or "").strip()
+        cleaned = re.sub(r"\s*\([+-]?\d+(?:\.\d+)?\)\s*$", "", cleaned)
+        return cleaned.strip(" -|:")
 
     def _fetch_pandascore(self, question: str, teams: Dict[str, str]) -> Dict[str, Any]:
         token = os.getenv("PANDASCORE_API_KEY", "")
@@ -239,6 +245,14 @@ class FreshContextFetcher:
     def _detect_esport_game(self, question: str) -> str:
         q = question.lower()
         if "lol:" in q or "league of legends" in q or "lck" in q or "lec" in q or "lpl" in q:
+            return "lol"
+        if any(alias in q for alias in [
+            "giantx", "karmine corp", "kcorp", "kc ", "fnatic", "mad lions",
+            "g2", "bds", "sk gaming", "team heretics", "rogue",
+            "anyone's legend", "team we", "bilibili", "blg", "top esports",
+            "tes", "jdg", "wbg", "weibo", "t1", "gen.g", "geng",
+            "dplus", "dk", "hanwha", "hle", "kt rolster", "drx",
+        ]):
             return "lol"
         if "dota" in q:
             return "dota2"
@@ -595,6 +609,10 @@ class FreshContextFetcher:
             "dplus": {"dplus", "kia", "dk"},
             "kia": {"dplus", "kia", "dk"},
             "dk": {"dplus", "kia", "dk"},
+            "kc": {"kc", "karmine", "corp", "kcorp"},
+            "karmine": {"kc", "karmine", "corp", "kcorp"},
+            "kcorp": {"kc", "karmine", "corp", "kcorp"},
+            "giantx": {"giantx", "giants"},
             "t1": {"t1"},
             "gen": {"gen", "geng"},
             "geng": {"gen", "geng"},

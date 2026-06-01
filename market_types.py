@@ -8,6 +8,7 @@ scoring, and position management classify the same market the same way.
 from __future__ import annotations
 
 import os
+import re
 from typing import Tuple
 
 MARKET_MACRO = "macro"
@@ -20,6 +21,16 @@ ESPORTS_KEYWORDS = [
     "lol:", "league of legends", "dota", "cs2", "csgo", "counter-strike",
     "valorant", "esports", "lck", "lec", "lpl", "lcs", "vct", "iem",
     "pgl", "blast", "dreamleague", "esl",
+]
+
+ESPORTS_TEAM_ALIASES = [
+    "giantx", "karmine corp", "kcorp", "kc ", "team vitality", "vitality",
+    "g2 esports", "g2 ", "fnatic", "fnt", "mad lions", "sk gaming",
+    "team heretics", "heretics", "bds", "rogue", "navi", "natus vincere",
+    "faze", "mouz", "astralis", "ence", "liquid", "cloud9", "t1",
+    "gen.g", "geng", "dplus", "dk", "hanwha", "hle", "kt rolster",
+    "kt ", "drx", "bro ", "bilibili", "blg", "top esports", "tes",
+    "jdg", "wbg", "weibo", "anyone's legend", "team we",
 ]
 
 ESPORTS_MAP_KEYWORDS = ["game ", "map "]
@@ -49,7 +60,11 @@ MACRO_KEYWORDS = [
 
 def classify_market(question: str) -> str:
     q = (question or "").lower()
-    if any(keyword in q for keyword in ESPORTS_KEYWORDS):
+    esports_hint = any(keyword in q for keyword in ESPORTS_KEYWORDS)
+    esports_team_hint = _contains_esports_team_alias(q)
+    if esports_hint or esports_team_hint:
+        if "game handicap" in q or "map handicap" in q:
+            return MARKET_ESPORTS_MATCH
         if any(keyword in q for keyword in ESPORTS_MAP_KEYWORDS):
             return MARKET_ESPORTS_MAP
         return MARKET_ESPORTS_MATCH
@@ -58,6 +73,21 @@ def classify_market(question: str) -> str:
     if any(keyword in q for keyword in MACRO_KEYWORDS):
         return MARKET_MACRO
     return MARKET_GENERAL
+
+
+def _contains_esports_team_alias(text: str) -> bool:
+    padded = f" {text} "
+    for alias in ESPORTS_TEAM_ALIASES:
+        alias_l = alias.lower()
+        if alias_l.endswith(" "):
+            if alias_l in padded:
+                return True
+        elif len(alias_l) <= 3 and alias_l.replace(".", "").isalnum():
+            if re.search(rf"(?<![a-z0-9]){re.escape(alias_l)}(?![a-z0-9])", text):
+                return True
+        elif alias_l in text:
+            return True
+    return False
 
 
 def is_sports(question: str) -> bool:

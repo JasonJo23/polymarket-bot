@@ -222,12 +222,19 @@ def _extract_opponents(question: str, gamma_data: Dict) -> str:
 
 
 def _strip_market_prefix(question: str) -> str:
-    return re.sub(
+    stripped = re.sub(
         r"^(?:lol|league of legends|dota\s*2?|cs2|csgo|valorant|nba|mlb|nhl|nfl|wnba|soccer|tennis):\s*",
         "",
         question or "",
         flags=re.IGNORECASE,
     ).strip()
+    stripped = re.sub(
+        r"^(?:game|map)\s+handicap:\s*",
+        "",
+        stripped,
+        flags=re.IGNORECASE,
+    ).strip()
+    return stripped
 
 
 def _parse_vs_opponents(text: str) -> Optional[Tuple[str, str]]:
@@ -254,7 +261,8 @@ def _parse_vs_opponents(text: str) -> Optional[Tuple[str, str]]:
 def _clean_opponent_name(name: str) -> str:
     """Normalisoi joukkueen nimi ilman markkinan lisateksteja."""
     cleaned = re.sub(r"\s+", " ", name or "").strip()
-    cleaned = re.sub(r"\s+(?:winner|moneyline|spread)$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*\([+-]?\d+(?:\.\d+)?\)\s*$", "", cleaned)
+    cleaned = re.sub(r"\s+(?:winner|moneyline|spread|handicap)$", "", cleaned, flags=re.IGNORECASE)
     return cleaned.strip(" -|:")
 
 
