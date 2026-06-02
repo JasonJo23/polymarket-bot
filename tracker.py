@@ -525,13 +525,14 @@ class SignalTracker:
                 log.error(f"Outcome '{outcome_name}' ei löydy: {[t.get('outcome') for t in tokens_list]}")
                 return False
 
-            if token_price < 0.05 or token_price > 0.90:
-                log.warning(f"Hinta {token_price} äärimmäinen — ohitetaan.")
-                return False
-
             signal["token_id"] = token_id
             signal["token_price"] = token_price
             signal["market_type"] = signal.get("market_type") or self._classify_market(signal.get("question", ""))
+
+            candidate_price_check = self._passes_candidate_price_rules(signal["market_type"], token_price)
+            if not candidate_price_check["approved"]:
+                log.warning(f"Hinta {token_price} äärimmäinen — {candidate_price_check['reason']}")
+                return False
 
             cooldown = self._edge_cooldown_reason(signal, token_price)
             if cooldown:
@@ -564,7 +565,17 @@ class SignalTracker:
                     return False
                 signal["intelligence"] = intel
             except Exception as e:
-                log.debug(f"Intelligence epäonnistui: {e}")
+                if os.getenv("INTELLIGENCE_FAIL_OPEN", "false").lower() == "true":
+                    log.warning(f"Intelligence epäonnistui, fail-open: {e}")
+                    signal["intelligence"] = {
+                        "approved": True,
+                        "reason": "Intelligence fail-open",
+                        "confidence": 0.0,
+                        "market_quality": 0.0,
+                    }
+                else:
+                    log.warning(f"Intelligence epäonnistui — ohitetaan signaali: {e}")
+                    return False
             try:
                 edge_result = _get_edge_detector().should_buy(signal, token_price)
                 signal["edge"] = edge_result

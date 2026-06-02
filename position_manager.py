@@ -75,7 +75,8 @@ def _sell_position_v2(
     token_id: str,
     amount: float,
     current_price: float,
-    reason: str
+    reason: str,
+    aggressive: bool = False,
 ) -> Dict[str, Any]:
     """
     Myy positio py_clob_client_v2:lla.
@@ -86,7 +87,12 @@ def _sell_position_v2(
             ClobClient, ApiCreds, OrderArgs,
             OrderType, Side, PartialCreateOrderOptions
         )
-        sell_price = round(max(0.01, current_price * 0.98), 3)
+        multiplier = (
+            float(os.getenv("STOP_LOSS_SELL_PRICE_MULTIPLIER", 0.90))
+            if aggressive else
+            float(os.getenv("LIMIT_SELL_PRICE_MULTIPLIER", 0.98))
+        )
+        sell_price = round(max(0.01, current_price * multiplier), 3)
 
         creds = ApiCreds(
             api_key=os.getenv("CLOB_API_KEY"),
@@ -305,6 +311,11 @@ def _evaluate_sports_position(position: Dict) -> Tuple[bool, str]:
     return False, ""
 
 
+def _is_stop_exit_reason(reason: str) -> bool:
+    text = (reason or "").lower()
+    return any(marker in text for marker in ("stop", " sl", "hata", "force exit"))
+
+
 def _evaluate_esports_position(position: Dict) -> Tuple[bool, str]:
     buy_price = float(position.get("buy_price", 0.5))
     current_price = float(position.get("current_price", 0.5))
@@ -411,6 +422,11 @@ def add_position(signal: Dict, token_id: str, buy_price: float, amount: float, e
     }
     positions.append(position)
     save_positions(positions)
+    try:
+        from daily_metrics import record_buy
+        record_buy(float(buy_price or 0.0) * float(amount or 0.0))
+    except Exception as e:
+        log.debug(f"Daily buy metrics paivitys epaonnistui: {e}")
     log.info(f"📌 Positio lisätty: {position['question'][:40]} | {position['outcome']} @ {buy_price}")
 
 
@@ -456,7 +472,13 @@ def check_and_exit_positions():
             should_sell, reason = _evaluate_macro_position(pos)
 
         if should_sell:
-            sell_result = _sell_position_v2(token_id, amount, current_price, reason)
+            sell_result = _sell_position_v2(
+                token_id,
+                amount,
+                current_price,
+                reason,
+                aggressive=_is_stop_exit_reason(reason),
+            )
             if sell_result.get("closed"):
                 sell_status = sell_result.get("status", "unknown")
                 if sell_status in ("dust_balance", "dust_remaining", "dust_amount", "missing_balance"):
@@ -466,6 +488,13 @@ def check_and_exit_positions():
                     )
                     continue
                 sold_count += 1
+                proceeds = float(sell_result.get("filled_usdc", 0.0) or 0.0)
+                cost = buy_price * amount
+                try:
+                    from daily_metrics import record_sell
+                    record_sell(proceeds, cost)
+                except Exception as e:
+                    log.debug(f"Daily PnL kirjauksen paivitys epaonnistui: {e}")
                 log.info(f"💰 Myyty: {question[:35]} | P&L: {pnl_pct:+.1%} | {reason}")
                 if notifier:
                     notifier.notify_sell(question, pnl_pct, reason)

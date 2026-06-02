@@ -21,7 +21,7 @@ import os
 import logging
 import requests
 from typing import Dict, Any, Tuple
-from market_types import classify_market, confidence_multiplier, is_sports
+from market_types import classify_market, confidence_multiplier, is_sports, price_bounds
 
 log = logging.getLogger("Scout.Intelligence")
 CLOB_BASE = "https://clob.polymarket.com"
@@ -64,18 +64,19 @@ def analyze_signal(signal: Dict[str, Any], token_id: str, token_price: float) ->
     min_confidence = float(os.getenv("MIN_CONFIDENCE", 20))
     min_liquidity  = float(os.getenv("MIN_LIQUIDITY", 0.05))
     question = signal.get("question", "")
-
-    if token_price < 0.05:
-        reason = f"Hinta liian matala ({token_price:.3f} < 0.05)"
-        log.warning(f"❌ Intelligence: {question[:40]} → {reason}")
-        return _result(False, 0.0, "unknown", 0.0, reason)
-
-    if token_price > 0.92:
-        reason = f"Hinta liian korkea ({token_price:.3f} > 0.92) — konsenssus selvä"
-        log.warning(f"❌ Intelligence: {question[:40]} → {reason}")
-        return _result(False, 0.0, "unknown", 0.0, reason)
-
     category, cat_multiplier = _detect_category(question)
+    low, high = price_bounds(category, relaxed=True)
+
+    if token_price < low:
+        reason = f"Hinta liian matala ({token_price:.3f} < {low:.2f}) [{category}]"
+        log.warning(f"❌ Intelligence: {question[:40]} → {reason}")
+        return _result(False, 0.0, category, 0.0, reason)
+
+    if token_price > high:
+        reason = f"Hinta liian korkea ({token_price:.3f} > {high:.2f}) — konsenssus selvä [{category}]"
+        log.warning(f"❌ Intelligence: {question[:40]} → {reason}")
+        return _result(False, 0.0, category, 0.0, reason)
+
     market_quality = _get_order_book_quality(token_id)
     confidence     = round(market_quality * 100 * cat_multiplier, 1)
 

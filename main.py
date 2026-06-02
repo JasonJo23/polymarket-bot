@@ -23,7 +23,7 @@ from fetcher import GammaFetcher
 from analyzer import WalletAnalyzer
 from tracker import SignalTracker
 from wallet_scorer import score_wallets_batch
-from state_store import read_json, write_json
+from daily_metrics import load_metrics, reset_if_new_day
 
 load_dotenv()
 
@@ -64,7 +64,8 @@ def main():
     min_signal_size      = float(os.getenv("MIN_SIGNAL_SIZE_USDC", 50000))
     max_orders_per_cycle = int(os.getenv("MAX_ORDERS_PER_CYCLE", 3))
     min_bankroll         = float(os.getenv("MIN_BANKROLL_USDC", 80))
-    max_daily_loss       = float(os.getenv("MAX_DAILY_LOSS_USDC", 30))
+    max_daily_spend      = float(os.getenv("MAX_DAILY_SPEND_USDC", os.getenv("MAX_DAILY_LOSS_USDC", 30)))
+    max_daily_realized_loss = float(os.getenv("MAX_DAILY_REALIZED_LOSS_USDC", os.getenv("MAX_DAILY_LOSS_USDC", 30)))
     position_check_interval = int(os.getenv("POSITION_CHECK_SECONDS", 300))
 
     log.info(
@@ -88,31 +89,16 @@ def main():
     )
     tracker = SignalTracker(smart_threshold=smart_threshold, dry_run=dry_run)
 
-    today_str        = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    daily_spent_usdc = 0.0
-
-    _spending_file = "daily_spending.json"
-    try:
-        _data = read_json(_spending_file, {})
-        if _data.get("date") == today_str:
-            daily_spent_usdc = float(_data.get("spent", 0))
-            log.info(f"Ladattu päiväkulut: {daily_spent_usdc:.2f} USDC")
-    except Exception:
-        pass
-
-    def save_spending():
-        try:
-            write_json(_spending_file, {"date": today_str, "spent": daily_spent_usdc})
-        except Exception:
-            pass
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    reset_if_new_day()
 
     while True:
         try:
             current_day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             if current_day != today_str:
-                today_str        = current_day
-                daily_spent_usdc = 0.0
-                log.info("Uusi päivä – päivittäinen kulukello nollattu.")
+                today_str = current_day
+                reset_if_new_day()
+                log.info("Uusi päivä – päivittäiset riskimittarit nollattu.")
 
             log.info("--- Uusi skannaus alkaa ---")
             cycle_start = time.time()
@@ -125,18 +111,42 @@ def main():
                 except Exception as e:
                     log.warning(f"Position check epäonnistui: {e}")
 
+            try:
+                from probability_engine import ProbabilityEngine
+                calibration = ProbabilityEngine().update_prediction_results()
+                if calibration.get("updated", 0):
+                    log.info(
+                        f"Kalibrointi: {calibration.get('updated', 0)} uutta ratkennutta "
+                        f"ennustetta ({calibration.get('checked', 0)} tarkistettu)"
+                    )
+            except Exception as e:
+                log.debug(f"Kalibroinnin paivitys epaonnistui: {e}")
+
             # Bankroll-tarkistus
             if not dry_run:
                 bankroll = get_bankroll_usdc()
-                log.info(f"💰 Kassa: {bankroll:.2f} USDC | Päiväkulut: {daily_spent_usdc:.2f} USDC")
+                daily = load_metrics()
+                daily_spend = float(daily.get("buy_spend_usdc", 0.0) or 0.0)
+                daily_pnl = float(daily.get("realized_pnl_usdc", 0.0) or 0.0)
+                daily_sells = float(daily.get("sell_proceeds_usdc", 0.0) or 0.0)
+                log.info(
+                    f"💰 Kassa: {bankroll:.2f} USDC | "
+                    f"Päiväosto: {daily_spend:.2f} | "
+                    f"Päivämyynnit: {daily_sells:.2f} | "
+                    f"Live PnL: {daily_pnl:+.2f} USDC"
+                )
 
                 if bankroll < min_bankroll:
                     log.error(f"🛑 KASSA LIIAN MATALA: {bankroll:.2f} < {min_bankroll:.0f} USDC — DRY RUN päälle!")
                     tracker.dry_run = True
                     dry_run = True
 
-                if daily_spent_usdc >= max_daily_loss:
-                    log.error(f"🛑 PÄIVÄRAJA TÄYNNÄ: {daily_spent_usdc:.2f} >= {max_daily_loss:.0f} USDC — ostot pysäytetty!")
+                if daily_spend >= max_daily_spend:
+                    log.error(f"🛑 PÄIVÄN OSTOKATTO TÄYNNÄ: {daily_spend:.2f} >= {max_daily_spend:.0f} USDC — ostot pysäytetty!")
+                    tracker.dry_run = True
+
+                if daily_pnl <= -max_daily_realized_loss:
+                    log.error(f"🛑 PÄIVÄN REALISOITU TAPPIORAJA: {daily_pnl:+.2f} <= -{max_daily_realized_loss:.0f} USDC — ostot pysäytetty!")
                     tracker.dry_run = True
 
             # 1. Haku
@@ -243,14 +253,12 @@ def main():
                         success = tracker.execute_order(sig)
 
                         if success and not dry_run:
-                            actual_size = sig.get(
-                                "_actual_order_size",
-                                float(os.getenv("MAX_ORDER_SIZE_USDC", 5))
-                            )
-                            daily_spent_usdc += actual_size
                             orders_this_cycle += 1
-                            save_spending()
-                            log.info(f"Päiväkulut: {daily_spent_usdc:.2f} USDC")
+                            daily = load_metrics()
+                            log.info(
+                                f"Päiväriskit: ostot={float(daily.get('buy_spend_usdc', 0.0)):.2f} | "
+                                f"realized_pnl={float(daily.get('realized_pnl_usdc', 0.0)):+.2f} USDC"
+                            )
                         elif success and dry_run:
                             orders_this_cycle += 1
                 else:

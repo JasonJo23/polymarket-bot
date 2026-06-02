@@ -37,6 +37,10 @@ ANTHROPIC_API = "https://api.anthropic.com/v1/messages"
 PREDICTIONS_FILE = "predictions_log.json"
 
 
+def _normalize_outcome(value: Any) -> str:
+    return re.sub(r"[^A-Z0-9]+", " ", str(value or "").upper()).strip()
+
+
 class ProbabilityEngine:
 
     def __init__(self):
@@ -400,6 +404,7 @@ Vastaa VAIN JSON, ei muuta tekstiä:
 
             entry = {
                 "timestamp":       datetime.now(timezone.utc).isoformat(),
+                "market_id":        context.get("market_id", ""),
                 "question":        question[:80],
                 "outcome":         outcome,
                 "polymarket_price": polymarket_price,
@@ -419,6 +424,47 @@ Vastaa VAIN JSON, ei muuta tekstiä:
 
         except Exception as e:
             log.debug(f"Prediction loki epäonnistui: {e}")
+
+    def update_prediction_results(self, max_updates: int = 50) -> Dict[str, Any]:
+        """Täyttää ratkenneiden ennusteiden actual_result-kentän."""
+        try:
+            data = read_json(PREDICTIONS_FILE, {"predictions": []})
+            predictions = data.get("predictions", []) if isinstance(data, dict) else []
+        except Exception as e:
+            return {"updated": 0, "checked": 0, "error": str(e)}
+
+        if not isinstance(predictions, list):
+            return {"updated": 0, "checked": 0, "error": "invalid_predictions"}
+
+        try:
+            from wallet_scorer import _get_winning_outcome
+        except Exception as e:
+            return {"updated": 0, "checked": 0, "error": str(e)}
+
+        checked = 0
+        updated = 0
+        for prediction in predictions:
+            if updated >= max_updates:
+                break
+            if prediction.get("actual_result") is not None:
+                continue
+            market_id = str(prediction.get("market_id", "") or "")
+            if not market_id:
+                continue
+            checked += 1
+            winner = _get_winning_outcome(market_id)
+            if winner is None:
+                continue
+            prediction["winning_outcome"] = winner
+            prediction["actual_result"] = _normalize_outcome(prediction.get("outcome", "")) == _normalize_outcome(winner)
+            prediction["resolved_at"] = datetime.now(timezone.utc).isoformat()
+            updated += 1
+
+        if updated > 0:
+            data["predictions"] = predictions
+            write_json(PREDICTIONS_FILE, data, indent=2)
+            log.info(f"Prediction calibration paivitetty: {updated} ratkennutta ennustetta")
+        return {"updated": updated, "checked": checked, "total": len(predictions)}
 
     def _no_edge_result(self, polymarket_price: float, reason: str) -> Dict:
         """Palauttaa tyhjän tuloksen kun edgeä ei löydy."""
