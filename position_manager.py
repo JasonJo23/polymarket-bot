@@ -316,6 +316,27 @@ def _is_stop_exit_reason(reason: str) -> bool:
     return any(marker in text for marker in ("stop", " sl", "hata", "force exit"))
 
 
+def _record_estimated_external_close(position: Dict, current_price: float, status: str) -> None:
+    """Kirjaa walletista kadonnut positio paivametriikkaan arviona."""
+    if status != "dust_balance":
+        return
+    try:
+        amount = float(position.get("amount", 0.0) or 0.0)
+        buy_price = float(position.get("buy_price", 0.0) or 0.0)
+        proceeds = round(amount * float(current_price or 0.0), 2)
+        cost = round(amount * buy_price, 2)
+        if amount <= 0 or proceeds <= 0 or cost <= 0:
+            return
+        from daily_metrics import record_sell
+        record_sell(proceeds, cost)
+        log.info(
+            f"External close arvioitu paivametriikkaan: "
+            f"proceeds={proceeds:.2f} cost={cost:.2f} status={status}"
+        )
+    except Exception as e:
+        log.debug(f"External close paivakirjaus epaonnistui: {e}")
+
+
 def _evaluate_esports_position(position: Dict) -> Tuple[bool, str]:
     buy_price = float(position.get("buy_price", 0.5))
     current_price = float(position.get("current_price", 0.5))
@@ -482,6 +503,7 @@ def check_and_exit_positions():
             if sell_result.get("closed"):
                 sell_status = sell_result.get("status", "unknown")
                 if sell_status in ("dust_balance", "dust_remaining", "dust_amount", "missing_balance"):
+                    _record_estimated_external_close(pos, current_price, sell_status)
                     log.info(
                         f"Positio poistettu seurannasta: {question[:35]} | "
                         f"status={sell_status}"
