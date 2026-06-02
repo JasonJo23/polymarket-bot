@@ -627,7 +627,7 @@ class SignalTracker:
                 return False
 
             from py_clob_client_v2 import (
-                ClobClient, ApiCreds, MarketOrderArgs, OrderArgs,
+                ClobClient, ApiCreds, OrderArgs,
                 OrderType, Side, PartialCreateOrderOptions
             )
 
@@ -666,13 +666,17 @@ class SignalTracker:
             if is_fast_event_market:
                 slippage   = float(os.getenv("SLIPPAGE_PCT", 0.02))
                 exec_price = round(min(token_price * (1 + slippage), 0.90), 3)
-                log.info(f"FOK event: {token_price} → {exec_price} | {order_size} USDC")
-                resp = client.create_and_post_market_order(
-                    order_args=MarketOrderArgs(
+                token_size = round(order_size / exec_price, 6)
+                log.info(
+                    f"Limit FOK event: {token_price} -> {exec_price} | "
+                    f"{order_size} USDC | {token_size} tokenia"
+                )
+                resp = client.create_and_post_order(
+                    order_args=OrderArgs(
                         token_id=token_id,
-                        amount=order_size,
+                        price=exec_price,
+                        size=token_size,
                         side=Side.BUY,
-                        order_type=OrderType.FOK,
                     ),
                     options=options,
                     order_type=OrderType.FOK,
@@ -1273,11 +1277,11 @@ class SignalTracker:
         }
 
     def _passes_fresh_spike(self, profile: Dict[str, Any], timing: Dict[str, Any]) -> bool:
-        min_support = int(os.getenv("FRESH_SPIKE_MIN_SUPPORT", max(self.smart_threshold + 5, 10)))
-        min_size = float(os.getenv("FRESH_SPIKE_MIN_SIZE_USDC", max(self.min_signal_size * 2, 100000)))
-        min_spike_support = int(os.getenv("FRESH_SPIKE_MIN_SOURCE_SUPPORT", max(6, min_support // 2)))
-        min_weighted_ratio = float(os.getenv("FRESH_SPIKE_MIN_WEIGHTED_RATIO", 0.65))
-        max_price_move = float(os.getenv("FRESH_SPIKE_MAX_PRICE_MOVE", 0.06))
+        min_support = int(os.getenv("FRESH_SPIKE_MIN_SUPPORT", max(self.smart_threshold + 4, 7)))
+        min_size = float(os.getenv("FRESH_SPIKE_MIN_SIZE_USDC", max(self.min_signal_size * 1.2, 60000)))
+        min_spike_support = int(os.getenv("FRESH_SPIKE_MIN_SOURCE_SUPPORT", max(4, min_support // 2)))
+        min_weighted_ratio = float(os.getenv("FRESH_SPIKE_MIN_WEIGHTED_RATIO", 0.60))
+        max_price_move = float(os.getenv("FRESH_SPIKE_MAX_PRICE_MOVE", 0.08))
         min_active = int(os.getenv("FRESH_SPIKE_MIN_ACTIVE_SUPPORT", 1))
         min_scope = int(os.getenv("FRESH_SPIKE_MIN_SCOUT_SCOPE_SUPPORT", 0))
 
