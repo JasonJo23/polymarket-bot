@@ -25,6 +25,7 @@ from typing import Optional, Dict, List, Any, Set
 import os
 import json
 import logging
+import math
 import requests
 from datetime import datetime, timezone, timedelta, date
 from collections import defaultdict
@@ -666,7 +667,8 @@ class SignalTracker:
             if is_fast_event_market:
                 slippage   = float(os.getenv("SLIPPAGE_PCT", 0.02))
                 exec_price = round(min(token_price * (1 + slippage), 0.90), 3)
-                token_size = round(order_size / exec_price, 6)
+                order_size = round(order_size, 2)
+                token_size = self._order_token_size(order_size, exec_price)
                 log.info(
                     f"Limit FOK event: {token_price} -> {exec_price} | "
                     f"{order_size} USDC | {token_size} tokenia"
@@ -683,7 +685,8 @@ class SignalTracker:
                 )
             else:
                 exec_price = round(token_price, 3)
-                token_size = round(order_size / exec_price, 6)
+                order_size = round(order_size, 2)
+                token_size = self._order_token_size(order_size, exec_price)
                 log.info(f"GTC makro: {exec_price} | {order_size} USDC | {token_size} tokenia")
                 resp = client.create_and_post_order(
                     order_args=OrderArgs(
@@ -1077,6 +1080,13 @@ class SignalTracker:
             size *= float(os.getenv("FRESH_SPIKE_ORDER_MULTIPLIER", 0.5))
         market_cap = self._market_order_cap(market_type)
         return max(round(min(size, self.max_order_usdc, market_cap), 2), self.min_order_usdc)
+
+    def _order_token_size(self, order_size_usdc: float, price: float) -> float:
+        """CLOB buy orders accept max 4 decimals for token/taker amount."""
+        if price <= 0:
+            return 0.0
+        raw_size = float(order_size_usdc or 0.0) / float(price)
+        return math.floor(raw_size * 10000) / 10000
 
     def _passes_profit_floor(self, market_type: str, token_price: float, order_size: float) -> Dict[str, Any]:
         """Vältä vetoja, joissa voitto on liian pieni suhteessa panokseen."""
