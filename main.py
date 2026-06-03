@@ -24,6 +24,7 @@ from analyzer import WalletAnalyzer
 from tracker import SignalTracker
 from wallet_scorer import score_wallets_batch
 from daily_metrics import load_metrics, reset_if_new_day
+from state_store import read_json
 
 load_dotenv()
 
@@ -37,6 +38,67 @@ logging.basicConfig(
     handlers=_handlers
 )
 log = logging.getLogger("Scout")
+
+
+def _open_position_count() -> int:
+    try:
+        data = read_json("open_positions.json", {"positions": []})
+        positions = data.get("positions", []) if isinstance(data, dict) else []
+        return len(positions) if isinstance(positions, list) else 0
+    except Exception:
+        return 0
+
+
+def _funnel_totals(cycles: list) -> dict:
+    totals = {}
+    for cycle in cycles:
+        for key, value in (cycle.get("funnel") or {}).items():
+            try:
+                totals[key] = totals.get(key, 0) + int(value or 0)
+            except (TypeError, ValueError):
+                pass
+    return totals
+
+
+def _maybe_send_cycle_summary(summary_cycles: list, window_started_at: float, last_bankroll: float):
+    if not summary_cycles:
+        return window_started_at, summary_cycles
+
+    enabled = os.getenv("TELEGRAM_CYCLE_SUMMARY_ENABLED", "true").lower() == "true"
+    interval_seconds = int(os.getenv("TELEGRAM_CYCLE_SUMMARY_SECONDS", 3600))
+    interval_cycles = int(os.getenv("TELEGRAM_CYCLE_SUMMARY_CYCLES", 0))
+    elapsed = time.time() - window_started_at
+    cycle_limit_hit = interval_cycles > 0 and len(summary_cycles) >= interval_cycles
+    time_limit_hit = interval_seconds > 0 and elapsed >= interval_seconds
+
+    if not enabled or not (cycle_limit_hit or time_limit_hit):
+        return window_started_at, summary_cycles
+
+    daily = load_metrics()
+    summary = {
+        "hours": elapsed / 3600,
+        "cycles": len(summary_cycles),
+        "order_attempts": sum(int(c.get("order_attempts", 0) or 0) for c in summary_cycles),
+        "accepted": sum(int(c.get("accepted", 0) or 0) for c in summary_cycles),
+        "strong": sum(int(c.get("strong", 0) or 0) for c in summary_cycles),
+        "funnel": _funnel_totals(summary_cycles),
+        "avg_cycle_seconds": (
+            sum(float(c.get("elapsed", 0.0) or 0.0) for c in summary_cycles) / max(len(summary_cycles), 1)
+        ),
+        "daily_spend": float(daily.get("buy_spend_usdc", 0.0) or 0.0),
+        "daily_pnl": float(daily.get("realized_pnl_usdc", 0.0) or 0.0),
+        "bankroll": float(last_bankroll or 0.0),
+        "open_positions": _open_position_count(),
+    }
+    try:
+        from notifier import notifier
+        if notifier:
+            notifier.notify_cycle_summary(summary)
+        log.info(f"Telegram tuntiyhteenveto lahetetty: {len(summary_cycles)} syklia")
+    except Exception as e:
+        log.debug(f"Telegram tuntiyhteenvedon lahetys epaonnistui: {e}")
+
+    return time.time(), []
 
 
 def get_bankroll_usdc() -> float:
@@ -91,6 +153,9 @@ def main():
 
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     reset_if_new_day()
+    summary_window_started_at = time.time()
+    summary_cycles = []
+    last_bankroll = 0.0
 
     while True:
         try:
@@ -102,6 +167,13 @@ def main():
 
             log.info("--- Uusi skannaus alkaa ---")
             cycle_start = time.time()
+            cycle_stats = {
+                "funnel": {},
+                "accepted": 0,
+                "strong": 0,
+                "order_attempts": 0,
+                "elapsed": 0.0,
+            }
 
             # Position check syklin alussa
             if not dry_run:
@@ -125,6 +197,7 @@ def main():
             # Bankroll-tarkistus
             if not dry_run:
                 bankroll = get_bankroll_usdc()
+                last_bankroll = bankroll
                 daily = load_metrics()
                 daily_spend = float(daily.get("buy_spend_usdc", 0.0) or 0.0)
                 daily_pnl = float(daily.get("realized_pnl_usdc", 0.0) or 0.0)
@@ -204,9 +277,11 @@ def main():
 
                 # 5. Signaalit
                 signals = tracker.process(qualified_wallets, raw_trades, wallet_scores=scores)
+                funnel = getattr(tracker, "last_funnel_stats", {}) or {}
+                cycle_stats["funnel"] = funnel
+                cycle_stats["accepted"] = int(funnel.get("accepted_candidates", 0) or 0)
 
                 if signals:
-                    funnel = getattr(tracker, "last_funnel_stats", {}) or {}
                     if funnel:
                         log.info(
                             "Funnel-yhteenveto: "
@@ -238,6 +313,7 @@ def main():
                         if s["support_count"] >= smart_threshold
                         and s["total_size_usdc"] >= min_signal_size
                     ]
+                    cycle_stats["strong"] = len(strong_signals)
 
                     log.info(
                         f"Jatkotarkastukseen hyvaksyttyja kandidaatteja: {len(strong_signals)} - "
@@ -254,6 +330,7 @@ def main():
 
                         if success and not dry_run:
                             orders_this_cycle += 1
+                            cycle_stats["order_attempts"] = orders_this_cycle
                             daily = load_metrics()
                             log.info(
                                 f"Päiväriskit: ostot={float(daily.get('buy_spend_usdc', 0.0)):.2f} | "
@@ -261,10 +338,18 @@ def main():
                             )
                         elif success and dry_run:
                             orders_this_cycle += 1
+                            cycle_stats["order_attempts"] = orders_this_cycle
                 else:
                     log.info("Ei signaaleja tällä syklillä.")
 
             elapsed = time.time() - cycle_start
+            cycle_stats["elapsed"] = elapsed
+            summary_cycles.append(cycle_stats)
+            summary_window_started_at, summary_cycles = _maybe_send_cycle_summary(
+                summary_cycles,
+                summary_window_started_at,
+                last_bankroll,
+            )
             log.info(f"Sykli valmis {elapsed:.1f}s. Odotetaan {poll_interval}s...")
 
         except KeyboardInterrupt:

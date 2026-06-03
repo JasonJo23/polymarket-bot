@@ -138,5 +138,27 @@ class TelegramNotifier:
         )
         self.send(msg)
 
+    def notify_cycle_summary(self, summary: dict):
+        hours = float(summary.get("hours", 0.0) or 0.0)
+        cycles = int(summary.get("cycles", 0) or 0)
+        funnel = summary.get("funnel", {}) or {}
+        msg = (
+            f"<b>BOTTIYHTEENVETO</b> ({hours:.1f}h)\n"
+            f"Syklit: {cycles} | Ostoyritykset: {int(summary.get('order_attempts', 0) or 0)}\n"
+            f"Paivaosto: {float(summary.get('daily_spend', 0.0) or 0.0):.2f} USDC | "
+            f"Live PnL: {float(summary.get('daily_pnl', 0.0) or 0.0):+.2f} USDC\n"
+            f"Kassa: {float(summary.get('bankroll', 0.0) or 0.0):.2f} USDC | "
+            f"Avoimet positiot: {int(summary.get('open_positions', 0) or 0)}\n"
+            f"Kandidaatit: {int(summary.get('accepted', 0) or 0)} | "
+            f"Jatkotark.: {int(summary.get('strong', 0) or 0)} | "
+            f"Fresh: {int(funnel.get('fresh_spike_candidates', 0) or 0)}\n"
+            f"Hylatty: hinta {int(funnel.get('price_extreme', 0) or 0)} | "
+            f"wallet/size {int(funnel.get('wallet_quality_or_size', 0) or 0)} | "
+            f"myoha/vola {int(funnel.get('late_or_volatile', 0) or 0)}\n"
+            f"Avg sykli: {float(summary.get('avg_cycle_seconds', 0.0) or 0.0):.1f}s | "
+            f"{_utc_time()}"
+        )
+        self.send(msg)
+
 
 notifier = TelegramNotifier()
