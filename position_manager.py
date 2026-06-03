@@ -29,6 +29,8 @@ except Exception:
 CLOB_BASE = "https://clob.polymarket.com"
 POSITION_DUST_TOKEN_THRESHOLD = float(os.getenv("POSITION_DUST_TOKEN_THRESHOLD", "0.01"))
 POSITION_DUST_USDC_THRESHOLD = float(os.getenv("POSITION_DUST_USDC_THRESHOLD", "0.25"))
+RESOLVED_STALE_GRACE_HOURS = float(os.getenv("RESOLVED_STALE_GRACE_HOURS", "24"))
+RECORD_STALE_RESOLVED_PNL = os.getenv("RECORD_STALE_RESOLVED_PNL", "false").lower() == "true"
 
 def _is_sports(question: str) -> bool:
     return _market_is_sports(question)
@@ -69,6 +71,20 @@ def _get_hours_until_close(end_date_str: str) -> float:
         return max(0, delta.total_seconds() / 3600)
     except Exception:
         return 24.0
+
+
+def _hours_since_close(end_date_str: str) -> Optional[float]:
+    try:
+        if not end_date_str or end_date_str == "?":
+            return None
+        end_dt = datetime.fromisoformat(
+            end_date_str.replace("Z", "+00:00").replace(" ", "T")
+        )
+        if not end_dt.tzinfo:
+            end_dt = end_dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - end_dt).total_seconds() / 3600)
+    except Exception:
+        return None
 
 
 def _sell_position_v2(
@@ -316,6 +332,91 @@ def _is_stop_exit_reason(reason: str) -> bool:
     return any(marker in text for marker in ("stop", " sl", "hata", "force exit"))
 
 
+def _normalize_outcome(value: Any) -> str:
+    import re
+    return re.sub(r"[^A-Z0-9]+", " ", str(value or "").upper()).strip()
+
+
+def _append_resolved_archive(position: Dict, record: Dict[str, Any]) -> None:
+    try:
+        data = read_json("resolved_positions.json", {"positions": []})
+        positions = data.get("positions", []) if isinstance(data, dict) else []
+        if not isinstance(positions, list):
+            positions = []
+        archived = dict(position)
+        archived.update(record)
+        positions.append(archived)
+        write_json("resolved_positions.json", {"positions": positions[-1000:]}, indent=2)
+    except Exception as e:
+        log.debug(f"Resolved-position arkistointi epaonnistui: {e}")
+
+
+def _record_resolved_close(position: Dict, proceeds: float, cost: float, should_record_daily: bool) -> None:
+    if not should_record_daily:
+        return
+    try:
+        from daily_metrics import record_sell
+        record_sell(proceeds, cost)
+    except Exception as e:
+        log.debug(f"Resolved close paivakirjaus epaonnistui: {e}")
+
+
+def _resolved_position_close(position: Dict, current_price: float, hours_since_close: Optional[float]) -> Optional[Dict[str, Any]]:
+    market_id = str(position.get("market_id", "") or "")
+    if not market_id:
+        return None
+
+    terminal_price = current_price >= 0.99 or current_price <= 0.01
+    if hours_since_close is None and not terminal_price:
+        return None
+    if hours_since_close is not None and hours_since_close <= 0 and not terminal_price:
+        return None
+
+    try:
+        from wallet_scorer import _get_winning_outcome
+        winner = _get_winning_outcome(market_id)
+    except Exception as e:
+        log.debug(f"Resolved winner haku epaonnistui: {e}")
+        winner = None
+
+    outcome = str(position.get("outcome", "") or "")
+    if winner:
+        won = _normalize_outcome(outcome) == _normalize_outcome(winner)
+    elif terminal_price and hours_since_close is not None and hours_since_close > 0:
+        won = current_price >= 0.99
+        winner = outcome if won else ""
+    else:
+        return None
+
+    amount = float(position.get("amount", 0.0) or 0.0)
+    buy_price = float(position.get("buy_price", 0.0) or 0.0)
+    cost = round(amount * buy_price, 2)
+    proceeds = round(amount if won else 0.0, 2)
+    pnl = round(proceeds - cost, 2)
+    stale = hours_since_close is not None and hours_since_close > RESOLVED_STALE_GRACE_HOURS
+    should_record_daily = (not stale) or RECORD_STALE_RESOLVED_PNL
+
+    record = {
+        "resolved_at": datetime.now(timezone.utc).isoformat(),
+        "close_status": "resolved_win" if won else "resolved_loss",
+        "winning_outcome": winner or "",
+        "proceeds_usdc": proceeds,
+        "cost_usdc": cost,
+        "realized_pnl_usdc": pnl,
+        "recorded_daily": should_record_daily,
+        "stale_cleanup": stale,
+    }
+    _record_resolved_close(position, proceeds, cost, should_record_daily)
+    _append_resolved_archive(position, record)
+
+    stale_text = " stale" if stale and not should_record_daily else ""
+    log.info(
+        f"Resolved position cleanup{stale_text}: {str(position.get('question', ''))[:35]} | "
+        f"{outcome} | winner={winner or '?'} | pnl={pnl:+.2f} USDC"
+    )
+    return record
+
+
 def _record_estimated_external_close(position: Dict, current_price: float, status: str) -> None:
     """Kirjaa walletista kadonnut positio paivametriikkaan arviona."""
     if status != "dust_balance":
@@ -474,6 +575,7 @@ def check_and_exit_positions():
             continue
 
         hours_left = _get_hours_until_close(end_date)
+        hours_since_close = _hours_since_close(end_date)
         pnl_pct    = (current_price - buy_price) / buy_price if buy_price > 0 else 0
 
         pos["current_price"] = current_price
@@ -481,6 +583,10 @@ def check_and_exit_positions():
         pos["is_esports_map"] = pos.get("is_esports_map", False) or _is_esports_map(question)
 
         log.info(f"📊 {question[:35]} | {pnl_pct:+.1%} | {hours_left:.1f}h jäljellä")
+
+        resolved_record = _resolved_position_close(pos, current_price, hours_since_close)
+        if resolved_record:
+            continue
 
         if pos.get("force_exit"):
             should_sell = True
