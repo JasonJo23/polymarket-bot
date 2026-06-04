@@ -70,7 +70,11 @@ class TelegramNotifier:
 
     def notify_buy(self, signal: dict, price: float, size: float, status: str):
         matched = str(status).lower() == "matched"
-        title = "✅ OSTO" if matched else "🟡 OSTOORDERI AUKI"
+        probe = bool(signal.get("probe_mode"))
+        if probe:
+            title = "🧪✅ PROBE OSTO" if matched else "🧪🟡 PROBE OSTOORDERI AUKI"
+        else:
+            title = "✅ OSTO" if matched else "🟡 OSTOORDERI AUKI"
         msg = (
             f"<b>{title}</b>\n"
             f"📊 {_text(signal.get('question'), 60)}\n"

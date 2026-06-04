@@ -580,9 +580,25 @@ class SignalTracker:
                 edge_result = _get_edge_detector().should_buy(signal, token_price)
                 signal["edge"] = edge_result
                 if not edge_result.get("approved", False):
-                    self._remember_edge_reject(signal, token_price, edge_result.get("reason", ""))
-                    log.warning(f"EdgeDetector hylkäsi: {edge_result.get('reason', '')}")
-                    return False
+                    probe_check = self._passes_probe_mode(signal, token_price, edge_result)
+                    if probe_check["approved"]:
+                        signal["probe_mode"] = True
+                        signal["edge"] = {
+                            **edge_result,
+                            "approved": True,
+                            "reason": f"Probe mode: {probe_check['reason']}",
+                        }
+                        log.warning(
+                            "Probe mode hyväksyi pienen kokeiluoston vaikka EdgeDetector hylkäsi: "
+                            f"{probe_check['reason']} | edge_reason={edge_result.get('reason', '')}"
+                        )
+                    else:
+                        self._remember_edge_reject(signal, token_price, edge_result.get("reason", ""))
+                        log.warning(
+                            f"EdgeDetector hylkäsi: {edge_result.get('reason', '')} | "
+                            f"probe={probe_check['reason']}"
+                        )
+                        return False
             except Exception as e:
                 if os.getenv("EDGE_DETECTOR_FAIL_OPEN", "false").lower() == "true":
                     log.warning(f"EdgeDetector epäonnistui, fail-open: {e}")
@@ -1050,6 +1066,11 @@ class SignalTracker:
         confidence = str(edge_info.get("confidence", "medium")).lower()
         market_type = signal.get("market_type") or self._classify_market(signal.get("question", ""))
 
+        if signal.get("probe_mode"):
+            probe_size = float(os.getenv("PROBE_ORDER_SIZE_USDC", 12))
+            market_cap = self._market_order_cap(market_type)
+            return max(round(min(probe_size, self.max_order_usdc, market_cap), 2), self.min_order_usdc)
+
         confidence_base = {
             "high": float(os.getenv("ORDER_SIZE_HIGH_CONFIDENCE", 40)),
             "medium": float(os.getenv("ORDER_SIZE_MEDIUM_CONFIDENCE", 20)),
@@ -1080,6 +1101,80 @@ class SignalTracker:
             size *= float(os.getenv("FRESH_SPIKE_ORDER_MULTIPLIER", 0.5))
         market_cap = self._market_order_cap(market_type)
         return max(round(min(size, self.max_order_usdc, market_cap), 2), self.min_order_usdc)
+
+    def _passes_probe_mode(
+        self,
+        signal: Dict[str, Any],
+        token_price: float,
+        edge_info: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Allow a small exploratory order for strong marginal signals."""
+        if os.getenv("PROBE_MODE_ENABLED", "false").lower() != "true":
+            return {"approved": False, "reason": "probe pois käytöstä"}
+
+        market_type = signal.get("market_type") or self._classify_market(signal.get("question", ""))
+        allowed = {
+            item.strip()
+            for item in os.getenv("PROBE_MARKET_TYPES", "sports,esports_match").split(",")
+            if item.strip()
+        }
+        if market_type not in allowed:
+            return {"approved": False, "reason": f"market_type {market_type} ei sallittu"}
+
+        min_price = float(os.getenv("PROBE_MIN_TOKEN_PRICE", 0.35))
+        max_price = float(os.getenv("PROBE_MAX_TOKEN_PRICE", 0.70))
+        if token_price < min_price or token_price > max_price:
+            return {
+                "approved": False,
+                "reason": f"hinta {token_price:.3f} ei probe-alueella {min_price:.2f}-{max_price:.2f}",
+            }
+
+        price_move = abs(float(signal.get("price_move_since_first_seen", 0.0) or 0.0))
+        max_move = float(os.getenv("PROBE_MAX_PRICE_MOVE", 0.06))
+        if price_move > max_move:
+            return {"approved": False, "reason": f"hintaliike {price_move:.3f} > {max_move:.3f}"}
+
+        support = int(signal.get("support_count", 0) or 0)
+        min_support = int(os.getenv("PROBE_MIN_SUPPORT", 12))
+        if support < min_support:
+            return {"approved": False, "reason": f"tuki {support} < {min_support}"}
+
+        high_weight = int(signal.get("high_weight_support", 0) or 0)
+        min_high = int(os.getenv("PROBE_MIN_HIGH_WEIGHT_SUPPORT", 6))
+        if high_weight < min_high:
+            return {"approved": False, "reason": f"high_weight {high_weight} < {min_high}"}
+
+        weighted = float(signal.get("weighted_support", 0.0) or 0.0)
+        min_weighted = float(os.getenv("PROBE_MIN_WEIGHTED_SUPPORT", 15))
+        if weighted < min_weighted:
+            return {"approved": False, "reason": f"weighted {weighted:.1f} < {min_weighted:.1f}"}
+
+        total_size = float(signal.get("total_size_usdc", 0.0) or 0.0)
+        min_size = float(os.getenv("PROBE_MIN_SIZE_USDC", 80000))
+        if total_size < min_size:
+            return {"approved": False, "reason": f"koko {total_size:.0f} < {min_size:.0f}"}
+
+        edge = float(edge_info.get("edge", 0.0) or 0.0)
+        min_edge = float(os.getenv("PROBE_MIN_EDGE", 0.02))
+        if edge < min_edge:
+            return {"approved": False, "reason": f"edge {edge:+.3f} < {min_edge:+.3f}"}
+
+        confidence = str(edge_info.get("confidence", "low")).lower()
+        allowed_conf = {
+            item.strip().lower()
+            for item in os.getenv("PROBE_ALLOWED_CONFIDENCE", "low,medium,high").split(",")
+            if item.strip()
+        }
+        if confidence not in allowed_conf:
+            return {"approved": False, "reason": f"confidence {confidence} ei sallittu"}
+
+        return {
+            "approved": True,
+            "reason": (
+                f"{market_type} small probe | edge={edge:+.3f} conf={confidence} "
+                f"support={support} high={high_weight} w={weighted:.1f} size={total_size:.0f}"
+            ),
+        }
 
     def _passes_profit_floor(self, market_type: str, token_price: float, order_size: float) -> Dict[str, Any]:
         """Vältä vetoja, joissa voitto on liian pieni suhteessa panokseen."""
