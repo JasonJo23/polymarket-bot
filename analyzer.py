@@ -26,6 +26,8 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 from collections import defaultdict
 
+from polymath_utils import parse_timestamp, parse_size_usdc, extract_address
+
 log = logging.getLogger("Scout.Analyzer")
 
 
@@ -163,37 +165,15 @@ class WalletAnalyzer:
         )
 
     def _extract_address(self, trade: Dict) -> Optional[str]:
-        for key in ("proxyWallet", "proxy_wallet", "_wallet_address", "maker"):
-            val = trade.get(key)
-            if val and isinstance(val, str) and val.startswith("0x") and len(val) == 42:
-                return val.lower()
-        return None
+        # Delegated to polymath_utils so address/timestamp/size parsing stays
+        # consistent across every module (each previously had its own key list).
+        return extract_address(trade)
 
     def _parse_timestamp(self, trade: Dict) -> Optional[datetime]:
-        raw = trade.get("timestamp")
-        if raw is None:
-            return None
-        try:
-            if isinstance(raw, (int, float)):
-                ts = raw / 1000 if raw > 1e10 else raw
-                return datetime.fromtimestamp(ts, tz=timezone.utc)
-            if isinstance(raw, str):
-                return datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        except (ValueError, OSError):
-            pass
-        return None
+        return parse_timestamp(trade)
 
     def _parse_size_usdc(self, trade: Dict) -> float:
-        for key in ("usdcSize", "size", "amount"):
-            raw = trade.get(key)
-            if raw is not None:
-                try:
-                    v = float(raw)
-                    if v > 0:
-                        return v
-                except (TypeError, ValueError):
-                    pass
-        return 0.0
+        return parse_size_usdc(trade)
 
     def _wallet_source(self, trades: List[Dict]) -> str:
         for trade in trades:

@@ -24,6 +24,7 @@ from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 from state_store import read_json, write_json
 from market_types import classify_market
+from polymath_utils import get_session
 
 log = logging.getLogger("Scout.WalletScorer")
 
@@ -144,7 +145,7 @@ def _score_cache_is_fresh(cached: Dict) -> bool:
 
 def _try_clob(condition_id: str) -> Optional[str]:
     try:
-        r = requests.get(f"{CLOB_BASE}/markets/{condition_id}", timeout=5)
+        r = get_session().get(f"{CLOB_BASE}/markets/{condition_id}", timeout=5)
         if r.status_code != 200:
             return None
         data = r.json()
@@ -163,7 +164,7 @@ def _try_clob(condition_id: str) -> Optional[str]:
 
 def _try_gamma(condition_id: str) -> Optional[str]:
     try:
-        r = requests.get(
+        r = get_session().get(
             f"{GAMMA_BASE}/markets",
             params={"condition_id": condition_id, "closed": "true"},
             timeout=5
@@ -254,16 +255,24 @@ def _parse_size_usdc(trade: Dict) -> float:
 
 
 def _group_trades_by_market(trade_history: List[Dict]) -> Dict[str, Dict[str, Dict[str, float]]]:
+    # When SELL_AWARE_ROI is enabled we also process SELL trades, so a wallet
+    # that exited before resolution is no longer credited with full
+    # hold-to-resolution payoff. Off by default → identical to the old
+    # BUY-only behaviour.
+    sell_aware = os.getenv("SELL_AWARE_ROI", "false").lower() == "true"
     market_positions: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(
         lambda: defaultdict(lambda: {
             "spend_usdc": 0.0,
             "shares": 0.0,
+            "sell_proceeds_usdc": 0.0,
+            "sell_shares": 0.0,
             "priced_trades": 0,
             "unpriced_trades": 0,
         })
     )
     for trade in trade_history:
-        if str(trade.get("side", "")).upper() != "BUY":
+        side = str(trade.get("side", "")).upper()
+        if side != "BUY" and not (sell_aware and side == "SELL"):
             continue
         condition_id = (
             trade.get("conditionId") or
@@ -277,9 +286,11 @@ def _group_trades_by_market(trade_history: List[Dict]) -> Dict[str, Dict[str, Di
         if not outcome:
             continue
         size = _parse_size_usdc(trade)
-        if size > 0:
-            price = _parse_trade_price(trade)
-            position = market_positions[condition_id][outcome]
+        if size <= 0:
+            continue
+        price = _parse_trade_price(trade)
+        position = market_positions[condition_id][outcome]
+        if side == "BUY":
             position["spend_usdc"] += size
             if price:
                 position["shares"] += size / price
@@ -287,6 +298,12 @@ def _group_trades_by_market(trade_history: List[Dict]) -> Dict[str, Dict[str, Di
             else:
                 position["shares"] += size
                 position["unpriced_trades"] += 1
+        else:  # SELL (only reached when sell_aware)
+            position["sell_proceeds_usdc"] += size
+            if price:
+                position["sell_shares"] += size / price
+            else:
+                position["sell_shares"] += size
     return market_positions
 
 
@@ -305,12 +322,34 @@ def _market_categories(trade_history: List[Dict]) -> Dict[str, str]:
     return categories
 
 
+def _position_sell_proceeds(position) -> float:
+    if isinstance(position, dict):
+        return float(position.get("sell_proceeds_usdc", 0.0) or 0.0)
+    return 0.0
+
+
+def _position_sell_shares(position) -> float:
+    if isinstance(position, dict):
+        return float(position.get("sell_shares", 0.0) or 0.0)
+    return 0.0
+
+
 def _calculate_market_roi(outcome_sizes: Dict[str, float], winning_outcome: str) -> Tuple[float, float, float]:
+    # Cost basis = total buy spend. Payoff = realized sell proceeds across all
+    # outcomes + remaining (unsold) winning shares. When there are no sells
+    # (sell_proceeds/sell_shares = 0) this reduces exactly to the old
+    # hold-to-resolution formula, so behaviour is unchanged unless SELL_AWARE_ROI
+    # populated the sell fields.
     total_usdc = sum(_position_spend(v) for v in outcome_sizes.values())
-    winning_usdc = _position_shares(outcome_sizes.get(winning_outcome, 0.0))
     if total_usdc <= 0:
         return 0.0, 0.0, 0.0
-    return round((winning_usdc - total_usdc) / total_usdc, 4), winning_usdc, total_usdc
+    realized = sum(_position_sell_proceeds(v) for v in outcome_sizes.values())
+    winning_pos = outcome_sizes.get(winning_outcome, 0.0)
+    remaining_winning_shares = max(
+        0.0, _position_shares(winning_pos) - _position_sell_shares(winning_pos)
+    )
+    payoff = realized + remaining_winning_shares
+    return round((payoff - total_usdc) / total_usdc, 4), payoff, total_usdc
 
 
 def _roi_to_weight(weighted_roi: float) -> float:
@@ -324,6 +363,39 @@ def _roi_to_weight(weighted_roi: float) -> float:
         return 0.8
     else:
         return 0.4
+
+
+def _shrunk_weighted_roi(weighted_roi: float, resolved_count: int) -> float:
+    """Shrink ROI toward 0 by sample size: roi * n / (n + K).
+
+    A wallet with very few resolved markets should not earn a high-conviction
+    weight off a tiny, noisy sample. Controlled by WALLET_SHRINKAGE_K
+    (default 10). Enabled via WALLET_WEIGHT_SHRINKAGE_ENABLED. Off by default.
+    """
+    try:
+        k = float(os.getenv("WALLET_SHRINKAGE_K", 10))
+    except ValueError:
+        k = 10.0
+    n = max(0, int(resolved_count))
+    if n <= 0:
+        return 0.0
+    return weighted_roi * (n / (n + k))
+
+
+def _apply_weight_adjustments(weight: float, weighted_roi: float, resolved_count: int,
+                              price_coverage: float) -> float:
+    """Apply optional, conservative weight adjustments (all off by default)."""
+    if os.getenv("WALLET_WEIGHT_SHRINKAGE_ENABLED", "false").lower() == "true":
+        weight = _roi_to_weight(_shrunk_weighted_roi(weighted_roi, resolved_count))
+
+    if os.getenv("PRICE_COVERAGE_DISCOUNT_ENABLED", "false").lower() == "true":
+        min_cov = float(os.getenv("PRICE_COVERAGE_MIN", 0.5))
+        cap = float(os.getenv("PRICE_COVERAGE_LOW_MAX_WEIGHT", 1.0))
+        if price_coverage < min_cov:
+            # Low price coverage => ROI/shares are unreliable; don't let such a
+            # wallet earn a high-conviction weight.
+            weight = min(weight, cap)
+    return weight
 
 
 def _classify_market_text(text: str) -> str:
@@ -513,6 +585,13 @@ def calculate_wallet_score(
     avg_roi      = total_roi_sum / checked
     weighted_roi = weighted_roi_sum / total_usdc_checked if total_usdc_checked > 0 else 0.0
     overall_weight = _roi_to_weight(weighted_roi)
+    price_coverage_val = (
+        priced_trades / (priced_trades + unpriced_trades)
+        if (priced_trades + unpriced_trades) else 0.0
+    )
+    overall_weight = _apply_weight_adjustments(
+        overall_weight, weighted_roi, checked, price_coverage_val
+    )
     if not activity["active_recently"]:
         overall_weight = min(overall_weight, float(os.getenv("INACTIVE_WALLET_MAX_WEIGHT", 0.8)))
 

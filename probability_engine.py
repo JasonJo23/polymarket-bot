@@ -30,6 +30,7 @@ import re
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 from state_store import read_json, write_json
+from polymath_utils import get_session
 
 log = logging.getLogger("Scout.ProbabilityEngine")
 
@@ -314,7 +315,7 @@ Vastaa VAIN JSON, ei muuta tekstiä:
                 "anthropic-version": "2023-06-01",
             }
 
-            r = requests.post(ANTHROPIC_API, json=payload, headers=headers, timeout=15)
+            r = get_session().post(ANTHROPIC_API, json=payload, headers=headers, timeout=15)
 
             if r.status_code == 200:
                 content = r.json().get("content", [])
@@ -419,6 +420,15 @@ Vastaa VAIN JSON, ei muuta tekstiä:
             }
 
             log_data["predictions"].append(entry)
+
+            # Bound the file so it cannot grow without limit (it is rewritten
+            # wholesale on every prediction). Keep the most recent N.
+            try:
+                max_keep = int(os.getenv("PREDICTIONS_LOG_MAX", 5000))
+            except ValueError:
+                max_keep = 5000
+            if max_keep > 0 and len(log_data["predictions"]) > max_keep:
+                log_data["predictions"] = log_data["predictions"][-max_keep:]
 
             write_json(PREDICTIONS_FILE, log_data, indent=2)
 

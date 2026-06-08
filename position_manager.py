@@ -18,6 +18,7 @@ from state_store import read_json, write_json
 from market_types import is_sports as _market_is_sports
 from market_types import is_esports as _market_is_esports
 from market_types import is_esports_map as _market_is_esports_map
+from polymath_utils import get_session
 
 log = logging.getLogger("Scout.PositionManager")
 
@@ -46,7 +47,7 @@ def _is_esports_map(question: str) -> bool:
 
 def _get_current_price(token_id: str) -> Optional[float]:
     try:
-        r = requests.get(
+        r = get_session().get(
             f"{CLOB_BASE}/price",
             params={"token_id": token_id, "side": "SELL"},
             timeout=5
@@ -167,7 +168,7 @@ def _sell_position_v2(
         # Hae tick size
         tick_size = "0.01"
         try:
-            r = requests.get(
+            r = get_session().get(
                 f"{CLOB_BASE}/tick-size",
                 params={"token_id": token_id},
                 timeout=5

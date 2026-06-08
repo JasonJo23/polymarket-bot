@@ -16,6 +16,7 @@ KORJAUKSET v3.0 → v4.0:
 import os
 import time
 import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
@@ -28,7 +29,10 @@ from state_store import read_json
 
 load_dotenv()
 
-_handlers = [logging.FileHandler("scout.log", encoding="utf-8")]
+# Rotating handler so scout.log can no longer grow without bound.
+_log_max_bytes = int(os.getenv("LOG_MAX_BYTES", 10 * 1024 * 1024))
+_log_backups = int(os.getenv("LOG_BACKUP_COUNT", 5))
+_handlers = [RotatingFileHandler("scout.log", maxBytes=_log_max_bytes, backupCount=_log_backups, encoding="utf-8")]
 if os.isatty(1):
     _handlers.append(logging.StreamHandler())
 
@@ -107,7 +111,9 @@ def get_bankroll_usdc() -> float:
         return get_usdc_balance_v2()
     except Exception as e:
         log.warning(f"Saldon haku epäonnistui: {e}")
-        return float(os.getenv("CURRENT_BANKROLL_USDC", 100.0))
+        # Negative sentinel signals "fetch failed" (vs. a genuine low balance)
+        # so the caller pauses this cycle only and does not pretend healthy.
+        return -1.0
 
 
 def main():
@@ -167,6 +173,10 @@ def main():
 
             log.info("--- Uusi skannaus alkaa ---")
             cycle_start = time.time()
+            # Reset the per-cycle buy pause. Risk gates below may re-pause buys
+            # for THIS cycle only (no permanent latch), so the bot recovers
+            # automatically when balance recovers or a new day resets the caps.
+            tracker.dry_run = dry_run
             cycle_stats = {
                 "funnel": {},
                 "accepted": 0,
@@ -212,7 +222,6 @@ def main():
                 if bankroll < min_bankroll:
                     log.error(f"🛑 KASSA LIIAN MATALA: {bankroll:.2f} < {min_bankroll:.0f} USDC — DRY RUN päälle!")
                     tracker.dry_run = True
-                    dry_run = True
 
                 if daily_spend >= max_daily_spend:
                     log.error(f"🛑 PÄIVÄN OSTOKATTO TÄYNNÄ: {daily_spend:.2f} >= {max_daily_spend:.0f} USDC — ostot pysäytetty!")
@@ -317,7 +326,7 @@ def main():
 
                     log.info(
                         f"Jatkotarkastukseen hyvaksyttyja kandidaatteja: {len(strong_signals)} - "
-                        f"{'yritetaan ostaa' if not dry_run else 'simuloidaan'}"
+                        f"{'yritetaan ostaa' if not tracker.dry_run else 'simuloidaan'}"
                     )
 
                     orders_this_cycle = 0
@@ -328,7 +337,7 @@ def main():
 
                         success = tracker.execute_order(sig)
 
-                        if success and not dry_run:
+                        if success and not tracker.dry_run:
                             orders_this_cycle += 1
                             cycle_stats["order_attempts"] = orders_this_cycle
                             daily = load_metrics()
@@ -336,7 +345,7 @@ def main():
                                 f"Päiväriskit: ostot={float(daily.get('buy_spend_usdc', 0.0)):.2f} | "
                                 f"realized_pnl={float(daily.get('realized_pnl_usdc', 0.0)):+.2f} USDC"
                             )
-                        elif success and dry_run:
+                        elif success and tracker.dry_run:
                             orders_this_cycle += 1
                             cycle_stats["order_attempts"] = orders_this_cycle
                 else:

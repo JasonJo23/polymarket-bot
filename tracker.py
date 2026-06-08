@@ -86,7 +86,9 @@ def get_usdc_balance_v2(allow_fallback: bool = False) -> float:
         return fallback
 
     log.error("Live-USDC saldoa ei saatu haettua - palautetaan 0.00, jotta ostot pysähtyvät")
-    return 0.0
+    # Negative sentinel: fetch failed (distinct from a real zero balance),
+    # so the caller pauses this cycle only instead of latching dry-run.
+    return -1.0
 
 
 class SignalTracker:
@@ -239,7 +241,8 @@ class SignalTracker:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         market_ids   = list(market_support.keys())
         market_infos: Dict[str, Dict] = {}
-        max_workers  = int(os.getenv("FETCH_WORKERS", 4))
+        # Align default with fetcher (was 4 here vs 16 there for the same var).
+        max_workers  = int(os.getenv("FETCH_WORKERS", 16))
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(self._get_market_info_clob, mid): mid for mid in market_ids}
@@ -592,6 +595,20 @@ class SignalTracker:
                             "Probe mode hyväksyi pienen kokeiluoston vaikka EdgeDetector hylkäsi: "
                             f"{probe_check['reason']} | edge_reason={edge_result.get('reason', '')}"
                         )
+                    elif os.getenv("EDGE_DETECTOR_SHADOW_MODE", "false").lower() == "true":
+                        # Shadow mode: log the edge verdict but do NOT block the
+                        # copy-trade, so copy-only vs copy+edge can be compared
+                        # from the logs before trusting the gate. Default OFF.
+                        signal["edge_shadow_blocked"] = True
+                        signal["edge"] = {
+                            **edge_result,
+                            "approved": True,
+                            "reason": "SHADOW (would reject): " + str(edge_result.get("reason", "")),
+                        }
+                        log.warning(
+                            "EdgeDetector SHADOW: would reject but shadow mode on, allowing trade. "
+                            + str(edge_result.get("reason", ""))
+                        )
                     else:
                         self._remember_edge_reject(signal, token_price, edge_result.get("reason", ""))
                         log.warning(
@@ -623,6 +640,11 @@ class SignalTracker:
             profit_check = self._passes_profit_floor(signal["market_type"], token_price, order_size)
             if not profit_check["approved"]:
                 log.warning(f"Riskisäännöt hylkäsivät tuotto-riskin: {profit_check['reason']}")
+                return False
+
+            exposure_check = self._passes_exposure_cap(order_size)
+            if not exposure_check["approved"]:
+                log.warning("Exposure cap rejected order: " + exposure_check["reason"])
                 return False
 
             if self.dry_run:
@@ -1099,8 +1121,70 @@ class SignalTracker:
         size = confidence_base * edge_multiplier * market_multiplier * support_multiplier
         if signal.get("signal_type") == "fresh_spike":
             size *= float(os.getenv("FRESH_SPIKE_ORDER_MULTIPLIER", 0.5))
+
+        # Optional fractional-Kelly sizing using the edge we already computed.
+        # Off by default; when enabled it REPLACES the bucket size but is still
+        # clamped by the same min/max/market caps below.
+        if os.getenv("KELLY_SIZING_ENABLED", "false").lower() == "true":
+            kelly_size = self._kelly_order_size(signal, edge)
+            if kelly_size is not None:
+                size = kelly_size
+
         market_cap = self._market_order_cap(market_type)
         return max(round(min(size, self.max_order_usdc, market_cap), 2), self.min_order_usdc)
+
+    def _kelly_order_size(self, signal: Dict[str, Any], edge: float) -> Optional[float]:
+        """Fractional-Kelly stake for a binary contract priced p with our prob q.
+
+        Full Kelly fraction = (q - p) / (1 - p), scaled by KELLY_FRACTION
+        (default 0.5), against a bankroll base from KELLY_BANKROLL_USDC (falls
+        back to CURRENT_BANKROLL_USDC). Returns None if inputs are unusable so
+        the caller keeps the bucket size.
+        """
+        edge_info = signal.get("edge") or {}
+        try:
+            p = float(signal.get("token_price", 0.0) or 0.0)
+            q = float(edge_info.get("our_probability", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if not (0.0 < p < 1.0) or not (0.0 < q < 1.0):
+            return None
+        full_kelly = (q - p) / (1.0 - p)
+        if full_kelly <= 0:
+            return None
+        fraction = float(os.getenv("KELLY_FRACTION", 0.5))
+        bankroll = float(os.getenv("KELLY_BANKROLL_USDC", os.getenv("CURRENT_BANKROLL_USDC", 100.0)))
+        stake = bankroll * full_kelly * fraction
+        log.info(
+            "Kelly sizing: p=%.3f q=%.3f f*=%.3f frac=%s bankroll=%.0f -> %.2f USDC"
+            % (p, q, full_kelly, fraction, bankroll, stake)
+        )
+        return max(0.0, stake)
+
+    def _passes_exposure_cap(self, order_size: float) -> Dict[str, Any]:
+        """Block new buys when total open position cost would exceed a cap.
+
+        Disabled when MAX_OPEN_EXPOSURE_USDC <= 0 (the default), so this is a
+        no-op until opted into.
+        """
+        cap = float(os.getenv("MAX_OPEN_EXPOSURE_USDC", 0))
+        if cap <= 0:
+            return {"approved": True, "reason": "exposure cap disabled"}
+        try:
+            positions = read_json("open_positions.json", {"positions": []}).get("positions", [])
+            current = sum(
+                float(p.get("buy_price", 0.0) or 0.0) * float(p.get("amount", 0.0) or 0.0)
+                for p in positions if isinstance(p, dict)
+            )
+        except Exception:
+            current = 0.0
+        if current + order_size > cap:
+            return {
+                "approved": False,
+                "reason": "open exposure %.2f + %.2f > %.2f USDC (MAX_OPEN_EXPOSURE_USDC)"
+                          % (current, order_size, cap),
+            }
+        return {"approved": True, "reason": "open exposure %.2f/%.2f USDC" % (current, cap)}
 
     def _passes_probe_mode(
         self,
@@ -1533,6 +1617,14 @@ class SignalTracker:
             "total_size_usdc": signal.get("total_size_usdc"),
         }
         try:
+            # Size-based rotation so the append-only log cannot grow forever.
+            max_bytes = int(os.getenv("SIGNAL_SNAPSHOTS_MAX_BYTES", 20 * 1024 * 1024))
+            if max_bytes > 0 and os.path.exists(_SIGNAL_SNAPSHOTS_FILE) \
+                    and os.path.getsize(_SIGNAL_SNAPSHOTS_FILE) > max_bytes:
+                try:
+                    os.replace(_SIGNAL_SNAPSHOTS_FILE, _SIGNAL_SNAPSHOTS_FILE + ".1")
+                except OSError:
+                    pass
             with open(_SIGNAL_SNAPSHOTS_FILE, "a", encoding="utf-8") as f:
                 f.write(json.dumps(snapshot, ensure_ascii=True) + "\n")
         except Exception as e:

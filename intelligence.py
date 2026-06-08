@@ -22,6 +22,7 @@ import logging
 import requests
 from typing import Dict, Any, Tuple
 from market_types import classify_market, confidence_multiplier, is_sports, price_bounds
+from polymath_utils import get_session
 
 log = logging.getLogger("Scout.Intelligence")
 CLOB_BASE = "https://clob.polymarket.com"
@@ -37,7 +38,7 @@ def _detect_category(question: str) -> Tuple[str, float]:
 
 def _get_order_book_quality(token_id: str) -> float:
     try:
-        r = requests.get(f"{CLOB_BASE}/book", params={"token_id": token_id}, timeout=5)
+        r = get_session().get(f"{CLOB_BASE}/book", params={"token_id": token_id}, timeout=5)
         if r.status_code != 200:
             return 0.5
         book = r.json()
