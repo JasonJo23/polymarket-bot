@@ -24,3 +24,8 @@ pending_orders.json
 # Local scratch/debug files
 debug*.py
 test_*.py
+
+# Trade ledger + Excel export (runtime state)
+trades.csv
+excel_export/
+signal_snapshots.jsonl.1

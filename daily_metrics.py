@@ -42,7 +42,8 @@ def save_metrics(metrics: Dict[str, Any]) -> None:
     write_json(_FILE, metrics, indent=2)
 
 
-def record_buy(spend_usdc: float) -> Dict[str, Any]:
+def record_buy(spend_usdc: float, question: str = "", outcome: str = "",
+               market_type: str = "", tokens: float = 0.0, price: float = 0.0) -> Dict[str, Any]:
     metrics = load_metrics()
     spend = round(max(0.0, float(spend_usdc or 0.0)), 2)
     if spend <= 0:
@@ -50,6 +51,12 @@ def record_buy(spend_usdc: float) -> Dict[str, Any]:
     metrics["buy_spend_usdc"] = round(float(metrics.get("buy_spend_usdc", 0.0)) + spend, 2)
     metrics["buy_count"] = int(metrics.get("buy_count", 0)) + 1
     save_metrics(metrics)
+    try:
+        from ledger import record_trade
+        record_trade("BUY", usdc=spend, cost=spend, pnl=0.0, tokens=tokens, price=price,
+                     question=question, outcome=outcome, market_type=market_type)
+    except Exception:
+        pass
     log.info(
         f"Daily metrics buy: spend={metrics['buy_spend_usdc']:.2f} USDC | "
         f"realized_pnl={float(metrics.get('realized_pnl_usdc', 0.0)):+.2f} USDC"
@@ -57,7 +64,9 @@ def record_buy(spend_usdc: float) -> Dict[str, Any]:
     return metrics
 
 
-def record_sell(proceeds_usdc: float, cost_usdc: float) -> Dict[str, Any]:
+def record_sell(proceeds_usdc: float, cost_usdc: float, question: str = "",
+                outcome: str = "", market_type: str = "", tokens: float = 0.0,
+                price: float = 0.0) -> Dict[str, Any]:
     metrics = load_metrics()
     proceeds = round(max(0.0, float(proceeds_usdc or 0.0)), 2)
     cost = round(max(0.0, float(cost_usdc or 0.0)), 2)
@@ -66,6 +75,12 @@ def record_sell(proceeds_usdc: float, cost_usdc: float) -> Dict[str, Any]:
     metrics["realized_pnl_usdc"] = round(float(metrics.get("realized_pnl_usdc", 0.0)) + pnl, 2)
     metrics["sell_count"] = int(metrics.get("sell_count", 0)) + 1
     save_metrics(metrics)
+    try:
+        from ledger import record_trade
+        record_trade("SELL", usdc=proceeds, cost=cost, pnl=pnl, tokens=tokens, price=price,
+                     question=question, outcome=outcome, market_type=market_type)
+    except Exception:
+        pass
     log.info(
         f"Daily metrics sell: proceeds={proceeds:.2f} cost={cost:.2f} "
         f"pnl={pnl:+.2f} | day_pnl={metrics['realized_pnl_usdc']:+.2f} USDC"

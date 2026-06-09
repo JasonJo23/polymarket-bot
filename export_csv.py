@@ -185,6 +185,48 @@ def build_summary(pos_rows, pred_rows):
     return ["metric", "value"], rows
 
 
+def build_ledger(d):
+    """Read trades.csv ledger -> (trades rows with cumulative, daily equity rows)."""
+    path = os.path.join(d, "trades.csv")
+    rows = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    except FileNotFoundError:
+        return None, None, None
+    cum = 0.0
+    trade_headers = ["timestamp", "action", "market_type", "question", "outcome",
+                     "tokens", "price", "usdc", "cost", "pnl", "cumulative_pnl"]
+    trade_rows = []
+    by_day = {}
+    for r in rows:
+        pnl = fnum(r.get("pnl"))
+        cum = round(cum + pnl, 4)
+        trade_rows.append([
+            r.get("timestamp", ""), r.get("action", ""), r.get("market_type", ""),
+            r.get("question", ""), r.get("outcome", ""), r.get("tokens", ""),
+            r.get("price", ""), r.get("usdc", ""), r.get("cost", ""),
+            round(pnl, 4), cum,
+        ])
+        day = str(r.get("timestamp", ""))[:10]
+        b = by_day.setdefault(day, {"day_pnl": 0.0, "buys": 0, "sells": 0,
+                                    "spend": 0.0, "proceeds": 0.0})
+        if r.get("action") == "BUY":
+            b["buys"] += 1; b["spend"] += fnum(r.get("usdc"))
+        else:
+            b["sells"] += 1; b["proceeds"] += fnum(r.get("usdc")); b["day_pnl"] += pnl
+    eq_headers = ["date", "buys", "sells", "spend_usdc", "proceeds_usdc",
+                  "day_pnl", "cumulative_pnl"]
+    eq_rows = []
+    run = 0.0
+    for day in sorted(by_day):
+        b = by_day[day]
+        run = round(run + b["day_pnl"], 4)
+        eq_rows.append([day, b["buys"], b["sells"], round(b["spend"], 2),
+                        round(b["proceeds"], 2), round(b["day_pnl"], 4), run])
+    return (trade_headers, trade_rows), (eq_headers, eq_rows), cum
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", default=".")
@@ -204,6 +246,15 @@ def main():
     write_csv(os.path.join(out, "positions.csv"), ph, pr)
     write_csv(os.path.join(out, "predictions.csv"), dh, dr)
     write_csv(os.path.join(out, "summary.csv"), sh, sr)
+
+    led = build_ledger(d)
+    ledger_total = ""
+    if led[0] is not None:
+        (th, tr), (eh, er), ledger_total = led
+        write_csv(os.path.join(out, "trades.csv"), th, tr)
+        write_csv(os.path.join(out, "equity.csv"), eh, er)
+        print("  trades.csv       (%d fills, cumulative PnL %s USDC)" % (len(tr), ledger_total))
+        print("  equity.csv       (%d days)" % len(er))
 
     print("Exported to %s/" % os.path.abspath(out))
     print("  summary.csv      (%d metrics)" % len(sr))

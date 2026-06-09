@@ -357,7 +357,11 @@ def _record_resolved_close(position: Dict, proceeds: float, cost: float, should_
         return
     try:
         from daily_metrics import record_sell
-        record_sell(proceeds, cost)
+        record_sell(proceeds, cost,
+                    question=position.get("question", ""), outcome=position.get("outcome", ""),
+                    market_type=position.get("market_type", ""),
+                    tokens=float(position.get("amount", 0.0) or 0.0),
+                    price=float(position.get("buy_price", 0.0) or 0.0))
     except Exception as e:
         log.debug(f"Resolved close paivakirjaus epaonnistui: {e}")
 
@@ -430,7 +434,11 @@ def _record_estimated_external_close(position: Dict, current_price: float, statu
         if amount <= 0 or proceeds <= 0 or cost <= 0:
             return
         from daily_metrics import record_sell
-        record_sell(proceeds, cost)
+        record_sell(proceeds, cost,
+                    question=position.get("question", ""), outcome=position.get("outcome", ""),
+                    market_type=position.get("market_type", ""),
+                    tokens=float(position.get("amount", 0.0) or 0.0),
+                    price=float(current_price or 0.0))
         log.info(
             f"External close arvioitu paivametriikkaan: "
             f"proceeds={proceeds:.2f} cost={cost:.2f} status={status}"
@@ -547,7 +555,10 @@ def add_position(signal: Dict, token_id: str, buy_price: float, amount: float, e
     save_positions(positions)
     try:
         from daily_metrics import record_buy
-        record_buy(float(buy_price or 0.0) * float(amount or 0.0))
+        record_buy(float(buy_price or 0.0) * float(amount or 0.0),
+                   question=position.get("question", ""), outcome=position.get("outcome", ""),
+                   market_type=position.get("market_type", ""),
+                   tokens=float(amount or 0.0), price=float(buy_price or 0.0))
     except Exception as e:
         log.debug(f"Daily buy metrics paivitys epaonnistui: {e}")
     log.info(f"📌 Positio lisätty: {position['question'][:40]} | {position['outcome']} @ {buy_price}")
@@ -621,7 +632,10 @@ def check_and_exit_positions():
                 cost = buy_price * amount
                 try:
                     from daily_metrics import record_sell
-                    record_sell(proceeds, cost)
+                    record_sell(proceeds, cost,
+                                question=question, outcome=pos.get("outcome", ""),
+                                market_type=pos.get("market_type", ""),
+                                tokens=float(amount or 0.0), price=float(current_price or 0.0))
                 except Exception as e:
                     log.debug(f"Daily PnL kirjauksen paivitys epaonnistui: {e}")
                 log.info(f"💰 Myyty: {question[:35]} | P&L: {pnl_pct:+.1%} | {reason}")
