@@ -703,7 +703,8 @@ class SignalTracker:
 
             if is_fast_event_market:
                 slippage   = float(os.getenv("SLIPPAGE_PCT", 0.02))
-                exec_price = round(min(token_price * (1 + slippage), 0.90), 3)
+                fill_cap   = float(os.getenv("EVENT_MAX_FILL_PRICE", 0.90))
+                exec_price = round(min(token_price * (1 + slippage), fill_cap), 3)
                 order_size = round(order_size, 2)
                 token_size = round(order_size / exec_price, 4) if exec_price > 0 else 0.0
                 log.info(
