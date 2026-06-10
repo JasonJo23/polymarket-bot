@@ -209,6 +209,11 @@ class SignalTracker:
                                Jos None, lasketaan tässä (fallback).
         """
         self._cycle_index += 1
+        # Refresh market info every cycle. _market_cache used to persist for the
+        # whole process lifetime, so a market cached as "accepting orders" stayed
+        # that way forever and produced phantom candidates on markets that had
+        # since closed/gone live. Clearing it forces a fresh accepting_orders check.
+        self._market_cache.clear()
         self._prune_edge_cooldowns()
         self.reconcile_pending_orders()
         if not qualified_wallets:
